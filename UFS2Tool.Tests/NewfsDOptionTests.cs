@@ -1262,5 +1262,102 @@ namespace UFS2Tool.Tests
                 "Image should have free blocks remaining after population");
             Assert.True(imageSize > 0, "Image size should be positive");
         }
+
+        [Theory]
+        [InlineData(65536, 65536, 256, 65536)]
+        [InlineData(32768, 4096, 64, 16384)]
+        public void DOption_FullCylinderGroupsUseFragmentsBeforeSuperblockBackup(
+            int blockSize, int fragSize, int blocksPerCg, int bytesPerInode)
+        {
+            // A file of 4 groups fills CG 1 and CG 2 completely.
+            // Fragments [0, sblkno) of those groups must hold data too, otherwise
+            // large explicit-size imports run out of space.
+            var data = new byte[4 * blocksPerCg * blockSize];
+            new Random(1).NextBytes(data);
+            File.WriteAllBytes(Path.Combine(_testDir, "big.bin"), data);
+
+            var creator = new Ufs2ImageCreator
+            {
+                BlockSize = blockSize,
+                FragmentSize = fragSize,
+                // FreeBSD compares -c against fs_fpg in fragments; the density keeps
+                // the minimum CG (fragsperinode * INOPB) at blocksPerCg blocks.
+                BlocksPerCylGroup = blocksPerCg * (blockSize / fragSize),
+                BytesPerInode = bytesPerInode,
+                MinFreePercent = 0,
+                SectorSize = 4096,
+            };
+            creator.CreateImageFromDirectory(_imagePath, _testDir, 8L * blocksPerCg * blockSize);
+
+            using (var fs = File.OpenRead(_imagePath))
+            using (var reader = new BinaryReader(fs))
+            {
+                fs.Position = Ufs2Constants.SuperblockOffset;
+                var sb = Ufs2Superblock.ReadFrom(reader);
+                Assert.True(sb.NumCylGroups > 3);
+                for (int cg = 1; cg <= 2; cg++)
+                {
+                    long cgHeaderOffset = ((long)cg * sb.CylGroupSize + sb.CblkNo) * sb.FSize;
+                    fs.Position = cgHeaderOffset + 0x1C; // cs_nbfree
+                    Assert.Equal(0, reader.ReadInt32());
+                    fs.Position = cgHeaderOffset + 0x24; // cs_nffree
+                    Assert.Equal(0, reader.ReadInt32());
+                }
+            }
+
+            using var image = new Ufs2Image(_imagePath, readOnly: true);
+            var result = image.FsckUfs();
+            Assert.True(result.Clean, string.Join("\n", result.Errors));
+            Assert.Equal(data, image.ReadFile(image.ResolvePath("/big.bin")));
+        }
+
+        [Theory]
+        [InlineData(65536, 65536, 256, 65536)]
+        [InlineData(32768, 4096, 64, 16384)]
+        public void AddFile_FullCylinderGroupsUseFragmentsBeforeSuperblockBackup(
+            int blockSize, int fragSize, int blocksPerCg, int bytesPerInode)
+        {
+            // Same layout as above, but the big file is written in place into an
+            // almost empty image, so the in-place allocator must use [0, sblkno).
+            File.WriteAllText(Path.Combine(_testDir, "small.txt"), "x");
+            var creator = new Ufs2ImageCreator
+            {
+                BlockSize = blockSize,
+                FragmentSize = fragSize,
+                // FreeBSD compares -c against fs_fpg in fragments; the density keeps
+                // the minimum CG (fragsperinode * INOPB) at blocksPerCg blocks.
+                BlocksPerCylGroup = blocksPerCg * (blockSize / fragSize),
+                BytesPerInode = bytesPerInode,
+                MinFreePercent = 0,
+                SectorSize = 4096,
+            };
+            creator.CreateImageFromDirectory(_imagePath, _testDir, 8L * blocksPerCg * blockSize);
+
+            var data = new byte[4 * blocksPerCg * blockSize];
+            new Random(1).NextBytes(data);
+            string bigFile = Path.Combine(_testDir, "big.bin");
+            File.WriteAllBytes(bigFile, data);
+            using (var image = new Ufs2Image(_imagePath, readOnly: false))
+                image.Add("/big.bin", bigFile);
+
+            using (var fs = File.OpenRead(_imagePath))
+            using (var reader = new BinaryReader(fs))
+            {
+                fs.Position = Ufs2Constants.SuperblockOffset;
+                var sb = Ufs2Superblock.ReadFrom(reader);
+                Assert.True(sb.NumCylGroups > 3);
+                for (int cg = 1; cg <= 2; cg++)
+                {
+                    long cgHeaderOffset = ((long)cg * sb.CylGroupSize + sb.CblkNo) * sb.FSize;
+                    fs.Position = cgHeaderOffset + 0x1C; // cs_nbfree
+                    Assert.Equal(0, reader.ReadInt32());
+                }
+            }
+
+            using var check = new Ufs2Image(_imagePath, readOnly: true);
+            var result = check.FsckUfs();
+            Assert.True(result.Clean, string.Join("\n", result.Errors));
+            Assert.Equal(data, check.ReadFile(check.ResolvePath("/big.bin")));
+        }
     }
 }
