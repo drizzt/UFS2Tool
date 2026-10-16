@@ -43,10 +43,10 @@ namespace UFS2Tool.Tests
         }
 
         /// <summary>
-        /// Verify that fs_maxcontig is set to maxbsize/bsize per FreeBSD mkfs.c defaults.
+        /// Verify that fs_maxcontig is set to MAXPHYS/bsize per FreeBSD mkfs.c defaults.
         /// </summary>
         [Fact]
-        public void Superblock_MaxContigIsMaxBSizeDivBSize()
+        public void Superblock_MaxContigIsMaxPhysDivBSize()
         {
             var creator = new Ufs2ImageCreator();
             long imageSize = 256 * 1024 * 1024;
@@ -58,7 +58,7 @@ namespace UFS2Tool.Tests
             fs.Position = Ufs2Constants.SuperblockOffset;
             var sb = Ufs2Superblock.ReadFrom(reader);
 
-            int expectedMaxContig = Math.Max(1, Ufs2Constants.MaxBSize / sb.BSize);
+            int expectedMaxContig = Math.Max(1, Ufs2Constants.MaxPhys / sb.BSize);
             Assert.Equal(expectedMaxContig, sb.MaxContig);
         }
 
@@ -1068,6 +1068,39 @@ namespace UFS2Tool.Tests
                 Assert.True(reclen <= dirBlkSiz,
                     $"DIRBLKSIZ chunk {chunk} has d_reclen={reclen} exceeding DIRBLKSIZ={dirBlkSiz}");
             }
+        }
+
+        /// <summary>
+        /// Cylinder group geometry must follow FreeBSD mkfs.c sizing; -N output and the
+        /// written superblock must agree. 14657 MB is from FreeBSD 15.1 newfs -N
+        /// ("4 cylinder groups of 3664.31MB, 58629 blks, 14848 inodes"); the others
+        /// from newfs -N on swap-backed md devices of the same size.
+        /// </summary>
+        [Theory]
+        [InlineData(2, 30017536L * 512, 65536, 65536, 262144, 4, 58629, 14848)]
+        [InlineData(2, 197299011584L, 65536, 65536, 262144, 13, 232105, 58112)]
+        [InlineData(2, 1L << 30, 16384, 2048, 0, 7, 9930 * 8, 39744)]
+        [InlineData(2, 1L << 30, 32768, 4096, 0, 4, 8193 * 8, 32896)]
+        [InlineData(2, 1L << 30, 4096, 512, 0, 111, 2369 * 8, 9488)]
+        public void CylinderGroupGeometry_MatchesFreeBsdNewfs(
+            int format, long size, int bsize, int fsize, int density, int ncg, int fpg, int ipg)
+        {
+            var output = new StringWriter();
+            var creator = new Ufs2ImageCreator
+            {
+                FilesystemFormat = format, BlockSize = bsize, FragmentSize = fsize,
+                MinFreePercent = 0, SectorSize = 512, BytesPerInode = density, Output = output,
+            };
+            creator.CreateImage(_imagePath, size);
+
+            using var image = new Ufs2Image(_imagePath, readOnly: true);
+            var sb = image.Superblock;
+            Assert.Equal(ncg, sb.NumCylGroups);
+            Assert.Equal(fpg, sb.CylGroupSize);
+            Assert.Equal(ipg, sb.InodesPerGroup);
+            Assert.Contains($"Cylinder groups: {sb.NumCylGroups}\n", output.ToString().Replace("\r", ""));
+            Assert.Contains($"Frags/group:   {sb.CylGroupSize}\n", output.ToString().Replace("\r", ""));
+            Assert.Contains($"Inodes/group:  {sb.InodesPerGroup}\n", output.ToString().Replace("\r", ""));
         }
     }
 }

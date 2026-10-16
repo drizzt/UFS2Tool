@@ -321,10 +321,8 @@ namespace UFS2Tool.Tests
             // Choose a size that doesn't divide evenly by fragsPerGroup,
             // ensuring the last CG is smaller than the others.
             var creator = new Ufs2ImageCreator();
-            int fragsPerBlock = creator.BlockSize / creator.FragmentSize;
-            int fragsPerGroup = Ufs2Constants.DefaultInodesPerGroup * fragsPerBlock;
-            // Use 2.5 CGs worth of fragments to ensure last CG is smaller
-            long totalFrags = (long)fragsPerGroup * 2 + fragsPerGroup / 2;
+            // FreeBSD geometry packs this into 4 CGs of 10248 frags; the last one is shorter
+            long totalFrags = 40960;
             long imageSize = totalFrags * creator.FragmentSize;
 
             creator.CreateImage(_imagePath, imageSize);
