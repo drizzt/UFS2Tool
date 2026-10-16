@@ -26,5 +26,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="DokanNet" Version="2.3.0.3" />
+    <PackageReference Include="LTRData.FuseDotNet" Version="1.0.0.14" />
   </ItemGroup>
 </Project>

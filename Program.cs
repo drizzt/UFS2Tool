@@ -2,6 +2,7 @@
 // Licensed under the BSD 2-Clause License. See LICENSE file for details.
 
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using UFS2Tool;
 
 namespace Ufs2Tool
@@ -2505,7 +2506,7 @@ namespace Ufs2Tool
         ///
         /// Where:
         ///   special = path to UFS image file or device
-        ///   node    = Windows drive letter (e.g., X:)
+        ///   node    = Windows drive letter (e.g., X:) or Linux directory
         ///   -o ro   = mount read-only (default)
         ///   -v      = verbose output
         /// </summary>
@@ -2517,11 +2518,9 @@ namespace Ufs2Tool
                 return 1;
             }
 
-            if (!OperatingSystem.IsWindows())
+            if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
             {
-                Console.Error.WriteLine("Error: mount_udf is only supported on Windows.");
-                Console.Error.WriteLine("       The Dokan driver must be installed.");
-                Console.Error.WriteLine("       Download from: https://github.com/dokan-dev/dokany/releases");
+                Console.Error.WriteLine("Error: mount_udf is only supported on Windows (Dokan) and Linux (FUSE).");
                 return 1;
             }
 
@@ -2573,7 +2572,7 @@ namespace Ufs2Tool
 
             if (positional.Count < 2)
             {
-                Console.Error.WriteLine("Error: Both <image-path> and <drive-letter> are required.");
+                Console.Error.WriteLine("Error: Both <image-path> and <mount-point> are required.");
                 PrintMountUdfUsage();
                 return 1;
             }
@@ -2588,8 +2587,17 @@ namespace Ufs2Tool
                 return 1;
             }
 
-            // Normalize mount point: accept "X:", "X:\", or just "X"
-            if (mountPoint.Length == 1 && char.IsLetter(mountPoint[0]))
+            // Linux (FUSE) mounts on a directory; Windows (Dokan) on a drive letter
+            if (!OperatingSystem.IsWindows())
+            {
+                if (!Directory.Exists(mountPoint))
+                {
+                    Console.Error.WriteLine($"Error: Mount point '{mountPoint}' is not an existing directory.");
+                    return 1;
+                }
+            }
+            // Normalize drive letter: accept "X:", "X:\", or just "X"
+            else if (mountPoint.Length == 1 && char.IsLetter(mountPoint[0]))
                 mountPoint += @":\";
             else if (mountPoint.Length == 2 && mountPoint[1] == ':')
                 mountPoint += @"\";
@@ -2606,7 +2614,8 @@ namespace Ufs2Tool
             // Validate the UFS image before mounting
             try
             {
-                using var testImage = new Ufs2Image(imagePath, readOnly: true);
+                // Open as the mount will, so a read-only image fails here for -o rw
+                using var testImage = new Ufs2Image(imagePath, readOnly: readOnly);
                 string fsType = testImage.Superblock.IsUfs1 ? "UFS1" : "UFS2";
                 if (verbose)
                 {
@@ -2634,6 +2643,16 @@ namespace Ufs2Tool
             Console.WriteLine("Press Ctrl+C to unmount and exit.");
             Console.WriteLine();
 
+            if (OperatingSystem.IsWindows())
+                return MountDokan(imagePath, mountPoint, readOnly, verbose);
+            if (OperatingSystem.IsLinux())
+                return MountFuse(imagePath, mountPoint, readOnly, verbose);
+            return 1;
+        }
+
+        [SupportedOSPlatform("windows")]
+        static int MountDokan(string imagePath, string mountPoint, bool readOnly, bool verbose)
+        {
             try
             {
                 using var dokanOps = new Ufs2DokanOperations(imagePath, readOnly);
@@ -2701,25 +2720,93 @@ namespace Ufs2Tool
             }
         }
 
+        [SupportedOSPlatform("linux")]
+        static int MountFuse(string imagePath, string mountPoint, bool readOnly, bool verbose)
+        {
+            // libfuse chdirs to "/" once mounted, so relative paths would break the Ctrl+C unmount.
+            mountPoint = Path.GetFullPath(mountPoint);
+            using var fuseOps = new Ufs2FuseOperations(imagePath, readOnly);
+            string[] fuseArgs =
+            [
+                "ufs2tool", "-f", "-s",
+                "-o", readOnly ? "ro" : "rw",
+                "-o", $"fsname={Path.GetFullPath(imagePath).Replace(",", "\\,")},subtype=ufs",
+                mountPoint,
+            ];
+
+            // .NET owns SIGINT, so libfuse does not install its own handler and Ctrl+C
+            // would kill the process and leave a dead mount. Unmount instead; that
+            // makes the FUSE loop below return.
+            ConsoleCancelEventHandler cancelHandler = (_, e) =>
+            {
+                e.Cancel = true;
+                Console.WriteLine();
+                Console.WriteLine("Unmounting...");
+                RunFusermountUnmount(mountPoint);
+            };
+            Console.CancelKeyPress += cancelHandler;
+            try
+            {
+                FuseDotNet.Logging.ILogger fuseLogger = verbose
+                    ? new FuseDotNet.Logging.ConsoleLogger("[FUSE] ")
+                    : new FuseDotNet.Logging.NullLogger();
+                FuseDotNet.Fuse.Mount(fuseOps, fuseArgs, fuseLogger);
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or FuseDotNet.PosixException)
+            {
+                Console.Error.WriteLine($"Error: FUSE mount failed: {ex.Message}");
+                Console.Error.WriteLine("       Ensure fuse3 (libfuse3 and fusermount3) is installed.");
+                return 1;
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancelHandler;
+            }
+
+            Console.WriteLine("Filesystem unmounted.");
+            return 0;
+        }
+
+        /// <summary>
+        /// Unmount a FUSE mount point as an unprivileged user. Returns fusermount3's exit code.
+        /// </summary>
+        static int RunFusermountUnmount(string mountPoint)
+        {
+            try
+            {
+                using var proc = System.Diagnostics.Process.Start("fusermount3", ["-u", mountPoint]);
+                proc.WaitForExit();
+                return proc.ExitCode;
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                Console.Error.WriteLine($"Error: Cannot run fusermount3: {ex.Message}");
+                return 1;
+            }
+        }
+
         /// <summary>
         /// Unmount a previously mounted UFS filesystem.
         /// Modeled after FreeBSD umount(8).
         ///
         /// Synopsis:
-        ///   umount_udf <drive-letter>
+        ///   umount_udf <drive-letter | directory>
         /// </summary>
         static int HandleUmountUdf(string[] args)
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Usage: ufs2tool umount_udf <drive-letter>");
-                Console.Error.WriteLine("  Example: ufs2tool umount_udf X:");
+                Console.Error.WriteLine("Usage: ufs2tool umount_udf <drive-letter | directory>");
+                Console.Error.WriteLine("  Example: ufs2tool umount_udf X:  (Linux: ufs2tool umount_udf ~/ufs)");
                 return 1;
             }
 
+            if (OperatingSystem.IsLinux())
+                return RunFusermountUnmount(args[1]);
+
             if (!OperatingSystem.IsWindows())
             {
-                Console.Error.WriteLine("Error: umount_udf is only supported on Windows.");
+                Console.Error.WriteLine("Error: umount_udf is only supported on Windows and Linux.");
                 return 1;
             }
 
@@ -2765,10 +2852,10 @@ namespace Ufs2Tool
             Console.Error.WriteLine("""
 
                 Usage:
-                  ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter>
+                  ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter | directory>
 
-                Mount a UFS1/UFS2 filesystem image as a Windows drive letter.
-                Requires the Dokan driver to be installed on the system.
+                Mount a UFS1/UFS2 filesystem image as a Windows drive letter (Dokan)
+                or on an existing directory on Linux (FUSE). Runs in the foreground.
 
                 Options:
                   -o ro      Mount read-only (default)
@@ -2779,14 +2866,17 @@ namespace Ufs2Tool
                   ufs2tool mount_udf myimage.img X:
                   ufs2tool mount_udf -o ro myimage.img X:
                   ufs2tool mount_udf -v myimage.img Z:
+                  ufs2tool mount_udf -o rw myimage.img ~/ufs     (Linux)
 
                 Unmount:
                   ufs2tool umount_udf X:
+                  ufs2tool umount_udf ~/ufs                      (Linux)
                   (or press Ctrl+C in the mount_udf terminal)
 
                 Prerequisites:
-                  Dokan driver must be installed:
+                  Windows: Dokan driver must be installed:
                   https://github.com/dokan-dev/dokany/releases
+                  Linux: fuse3 (libfuse3 and fusermount3)
                 """);
         }
 
@@ -3043,12 +3133,12 @@ namespace Ufs2Tool
                           (Modeled after FreeBSD du(1))
                   devinfo <device-path>
                           Show device size and sector information
-                  mount_udf [-o options] [-v] <image-path> <drive-letter>
-                          Mount a UFS1/UFS2 image as a Windows drive using Dokan.
-                          Requires the Dokan driver. Supports read-only and read-write access.
+                  mount_udf [-o options] [-v] <image-path> <drive-letter | directory>
+                          Mount a UFS1/UFS2 image as a Windows drive (Dokan) or on a
+                          Linux directory (FUSE). Supports read-only and read-write access.
                           (Modeled after FreeBSD mount_udf(8) / mount(8))
-                  umount_udf <drive-letter>
-                          Unmount a previously mounted UFS drive.
+                  umount_udf <drive-letter | directory>
+                          Unmount a previously mounted UFS image.
 
                 Target can be a device (\\.\PhysicalDrive2) or an image file (myimage.img).
                 Device targets auto-detect size; image targets require size in MB or -D.
@@ -3103,7 +3193,7 @@ namespace Ufs2Tool
                   ufs2tool umount_udf X:
 
                 Note: Device operations require Administrator privileges.
-                      mount_udf requires the Dokan driver to be installed.
+                      mount_udf requires Dokan (Windows) or fuse3 (Linux).
 
                 For full newfs options: ufs2tool newfs --help
                 For full tunefs options: ufs2tool tunefs --help

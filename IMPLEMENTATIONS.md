@@ -24,6 +24,7 @@ UFS2-Tool is a complete implementation of FreeBSD's `newfs(8)`, `makefs(8)`, `tu
 | `Ufs2Constants.cs` | UFS filesystem constants |
 | `DriveIO.cs` | Windows raw device I/O (Win32 P/Invoke) |
 | `Ufs2DokanOperations.cs` | Dokan virtual filesystem for mounting UFS images |
+| `Ufs2FuseOperations.cs` | FUSE virtual filesystem for mounting UFS images on Linux |
 | `AlignedStream.cs` | Sector-aligned buffered write wrapper |
 | `app.manifest` | Windows application manifest (admin elevation) |
 
@@ -423,13 +424,13 @@ ufs2tool du -d 1 myimage.img
 
 Displays Windows device information including total size and sector size for physical drives and volumes. Requires Administrator privileges.
 
-### `mount_udf` — Mount UFS image as Windows drive
+### `mount_udf` — Mount UFS image
 
-Mounts a UFS1/UFS2 filesystem image as a Windows drive letter using the Dokan user-mode filesystem driver. Modeled after FreeBSD's `mount_udf(8)` and `mount(8)` commands.
+Mounts a UFS1/UFS2 filesystem image as a Windows drive letter using the Dokan user-mode filesystem driver, or on an existing directory on Linux using FUSE (libfuse3). Modeled after FreeBSD's `mount_udf(8)` and `mount(8)` commands.
 
 **Synopsis:**
 ```
-ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter>
+ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter | directory>
 ```
 
 **Features:**
@@ -446,22 +447,24 @@ ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter>
 |--------|-------------|
 | `-o ro` | Mount read-only (default) |
 | `-o rw` | Mount read-write (modify existing files) |
-| `-v` | Verbose output with Dokan debug logging |
+| `-v` | Verbose output with Dokan/FUSE debug logging |
 
 **Prerequisites:**
-- Requires the [Dokan driver](https://github.com/dokan-dev/dokany/releases) to be installed on Windows
-- Requires Administrator privileges
+- Windows: requires the [Dokan driver](https://github.com/dokan-dev/dokany/releases) and Administrator privileges
+- Linux: requires fuse3 (`libfuse3` and `fusermount3`); no root needed
 
 **Limitations:**
-- Symlinks are presented as regular files containing the link target
+- Windows: symlinks are presented as regular files containing the link target
+- Linux: symlinks are real symlinks; ownership changes and cross-directory renames are refused
+- New files, directories and links cannot be created through the mount
 
-### `umount_udf` — Unmount a UFS drive
+### `umount_udf` — Unmount a UFS image
 
-Unmounts a previously mounted UFS filesystem drive. Alternatively, pressing Ctrl+C in the `mount_udf` terminal also cleanly unmounts.
+Unmounts a previously mounted UFS filesystem (drive letter on Windows, directory on Linux via `fusermount3 -u`). Alternatively, pressing Ctrl+C in the `mount_udf` terminal also cleanly unmounts.
 
 **Synopsis:**
 ```
-ufs2tool umount_udf <drive-letter>
+ufs2tool umount_udf <drive-letter | directory>
 ```
 
 ## Core Library (`UFS2Tool`)
@@ -557,6 +560,14 @@ ufs2tool umount_udf <drive-letter>
 - Set file timestamps in read-write mode
 - Pattern-based file search (`FindFilesWithPattern`)
 - File security descriptor queries (returns `NotImplemented` for Unix-based permissions)
+
+### FUSE Virtual Filesystem (`Ufs2FuseOperations`)
+
+- Implements FuseDotNet `IFuseOperations` to mount a UFS image on a Linux directory (libfuse3)
+- Same `Ufs2Image` calls and locking as the Dokan backend
+- Exposes Unix mode, owner, link count, inode numbers and nanosecond timestamps; reads fast and slow symlinks
+- Read-write mode: write, truncate, unlink, rmdir (empty only), same-directory rename, chmod, utimes
+- Create, mkdir, symlink, link and chown are refused
 
 ## GUI Application (`UFS2Tool.GUI`)
 

@@ -248,6 +248,31 @@ namespace UFS2Tool
         }
 
         /// <summary>
+        /// Read a symlink target. A short target is stored inline in the block
+        /// pointer area (FreeBSD ufs_readlink); a longer one lives in data blocks.
+        /// </summary>
+        public byte[] ReadSymlinkTarget(uint inodeNumber)
+        {
+            var inode = ReadInode(inodeNumber);
+            if (!inode.IsSymlink)
+                throw new InvalidOperationException($"Inode {inodeNumber} is not a symlink.");
+
+            if (inode.Size >= Superblock.MaxSymlinkLen && inode.Blocks != 0)
+                return ReadFile(inodeNumber);
+
+            // UFS1 pointers are 32-bit and were widened on read; take the on-disk width back.
+            int ptrSize = Superblock.IsUfs1 ? 4 : 8;
+            byte[] raw = new byte[(Ufs2Constants.NDirect + Ufs2Constants.NIndirect) * ptrSize];
+            int pos = 0;
+            foreach (long ptr in inode.DirectBlocks.Concat(inode.IndirectBlocks))
+            {
+                BitConverter.GetBytes(ptr).AsSpan(0, ptrSize).CopyTo(raw.AsSpan(pos));
+                pos += ptrSize;
+            }
+            return raw[..(int)Math.Min(inode.Size, raw.Length)];
+        }
+
+        /// <summary>
         /// Read the contents of a regular file or symlink by inode number.
         /// </summary>
         public byte[] ReadFile(uint inodeNumber)
@@ -2686,7 +2711,7 @@ namespace UFS2Tool
             var inode = ReadInode(targetInode);
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            if (inode.IsRegularFile)
+            if (inode.IsRegularFile || inode.IsSymlink)
             {
                 FreeFileBlocks(inode);
                 RemoveDirectoryEntry(parentInode, entryName);
@@ -2896,7 +2921,7 @@ namespace UFS2Tool
         /// <summary>
         /// Get the parent path component from a filesystem path.
         /// </summary>
-        private static string GetParentPath(string fsPath)
+        internal static string GetParentPath(string fsPath)
         {
             string trimmed = fsPath.TrimEnd('/');
             int lastSlash = trimmed.LastIndexOf('/');
@@ -2907,7 +2932,7 @@ namespace UFS2Tool
         /// <summary>
         /// Get the last component (file or directory name) from a filesystem path.
         /// </summary>
-        private static string GetLastComponent(string fsPath)
+        internal static string GetLastComponent(string fsPath)
         {
             string trimmed = fsPath.TrimEnd('/');
             int lastSlash = trimmed.LastIndexOf('/');
