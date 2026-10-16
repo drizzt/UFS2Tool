@@ -176,6 +176,12 @@ namespace UFS2Tool
             if (AvgFilesPerDir <= 0)
                 throw new ArgumentException(
                     $"Average files per directory must be positive. Got: {AvgFilesPerDir}");
+
+            // Valid FFS, but the Linux kernel ufs driver rejects fsize > 4096 (fs/ufs/super.c).
+            if (FragmentSize > 4096)
+                (ErrorOutput ?? Console.Error).WriteLine(
+                    $"Warning: fragment size {FragmentSize} is too large for the Linux kernel ufs driver (max 4096). " +
+                    "Mount it on FreeBSD, or with 'ufs2tool mount_udf' (FUSE) on Linux.");
         }
 
         /// <summary>
