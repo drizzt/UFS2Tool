@@ -2038,7 +2038,7 @@ namespace UFS2Tool
             {
                 var (frag, cg) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation,
                     perCgHighWater, totalFrags);
                 rootBlocks.Add((long)cg * fragsPerGroup + frag);
             }
@@ -2184,7 +2184,7 @@ namespace UFS2Tool
                     {
                         var (frag, cg) = AllocateDataBlock(
                             fragsPerBlock, fragsPerGroup, dataStartFrag,
-                            ref nextDataFragInCg, ref currentCg, sb.NumCylGroups,
+                            ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation,
                             perCgHighWater, totalFrags);
                         dirBlocks.Add((long)cg * fragsPerGroup + frag);
                     }
@@ -2283,9 +2283,15 @@ namespace UFS2Tool
         /// </summary>
         private static (int fragOffset, int cgIndex) AllocateDataBlock(
             int fragsPerBlock, int fragsPerGroup, int dataStartFrag,
-            ref int nextDataFragInCg, ref int currentCg, int numCylGroups,
+            ref int nextDataFragInCg, ref int currentCg, int numCylGroups, int sblkno,
             int[]? perCgHighWater = null, long totalFrags = 0)
         {
+            // In CG > 0, fragments [0, sblkno) are free data space (FreeBSD initcg()).
+            // sblkno is block-aligned, so once a block no longer fits there, skip the
+            // superblock backup, CG header and inode table to the data area.
+            if (nextDataFragInCg < dataStartFrag && nextDataFragInCg + fragsPerBlock > sblkno)
+                nextDataFragInCg = dataStartFrag;
+
             // Compute the actual fragment limit for the current CG.
             // The last CG may have fewer usable fragments than fragsPerGroup.
             int cgFragLimit = fragsPerGroup;
@@ -2301,7 +2307,7 @@ namespace UFS2Tool
                 currentCg++;
                 if (currentCg >= numCylGroups)
                     throw new InvalidOperationException("Image is too small: no more cylinder groups available for data.");
-                nextDataFragInCg = dataStartFrag;
+                nextDataFragInCg = fragsPerBlock <= sblkno ? 0 : dataStartFrag;
 
                 // Recompute the fragment limit for the new CG, since the last CG
                 // may have fewer usable fragments than a full-sized CG.
@@ -2365,7 +2371,7 @@ namespace UFS2Tool
                 // Allocate an indirect pointer block
                 var (indFragOffset, indCgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation,
                     perCgHighWater, totalFrags);
                 long indirectBlockFrag = (long)indCgIdx * fragsPerGroup + indFragOffset;
                 alloc.IndirectBlockFrag = indirectBlockFrag;
@@ -2412,7 +2418,7 @@ namespace UFS2Tool
             {
                 var (dataFragOffset, dataCgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                     totalFrags);
 
                 long dataBlockFrag = (long)dataCgIdx * fragsPerGroup + dataFragOffset;
@@ -2475,7 +2481,7 @@ namespace UFS2Tool
             {
                 var (fragOffset, cgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                     totalFrags);
 
                 long blockFrag = (long)cgIdx * fragsPerGroup + fragOffset;
@@ -2500,7 +2506,7 @@ namespace UFS2Tool
                 // Allocate the indirect block itself
                 var (indFragOffset, indCgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                     totalFrags);
                 long indirectBlockFrag = (long)indCgIdx * fragsPerGroup + indFragOffset;
                 result.IndirectBlockFrag = indirectBlockFrag;
@@ -2522,7 +2528,7 @@ namespace UFS2Tool
                 // Allocate the double-indirect block itself
                 var (dindFragOffset, dindCgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                     totalFrags);
                 long doubleIndirectBlockFrag = (long)dindCgIdx * fragsPerGroup + dindFragOffset;
                 result.DoubleIndirectBlockFrag = doubleIndirectBlockFrag;
@@ -2541,7 +2547,7 @@ namespace UFS2Tool
                     // Allocate the single-indirect block for this entry
                     var (sindFragOffset, sindCgIdx) = AllocateDataBlock(
                         fragsPerBlock, fragsPerGroup, dataStartFrag,
-                        ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                        ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                         totalFrags);
                     long sindBlockFrag = (long)sindCgIdx * fragsPerGroup + sindFragOffset;
                     result.MetadataBlockCount++;
@@ -2572,7 +2578,7 @@ namespace UFS2Tool
                 // Allocate the triple-indirect block itself
                 var (tindFragOffset, tindCgIdx) = AllocateDataBlock(
                     fragsPerBlock, fragsPerGroup, dataStartFrag,
-                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                    ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                     totalFrags);
                 long tripleIndirectBlockFrag = (long)tindCgIdx * fragsPerGroup + tindFragOffset;
                 result.TripleIndirectBlockFrag = tripleIndirectBlockFrag;
@@ -2592,7 +2598,7 @@ namespace UFS2Tool
                     // Allocate a double-indirect block
                     var (dindFragOffset2, dindCgIdx2) = AllocateDataBlock(
                         fragsPerBlock, fragsPerGroup, dataStartFrag,
-                        ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                        ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                         totalFrags);
                     long dindBlockFrag = (long)dindCgIdx2 * fragsPerGroup + dindFragOffset2;
                     result.MetadataBlockCount++;
@@ -2616,7 +2622,7 @@ namespace UFS2Tool
 
                         var (sindFragOffset, sindCgIdx) = AllocateDataBlock(
                             fragsPerBlock, fragsPerGroup, dataStartFrag,
-                            ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, perCgHighWater,
+                            ref nextDataFragInCg, ref currentCg, sb.NumCylGroups, sb.SuperblockLocation, perCgHighWater,
                             totalFrags);
                         long sindBlockFrag = (long)sindCgIdx * fragsPerGroup + sindFragOffset;
                         result.MetadataBlockCount++;
@@ -3150,15 +3156,11 @@ namespace UFS2Tool
                 // Determine which data fragments are used in this CG
                 // Use per-CG high-water mark for accurate accounting of trailing
                 // unused fragments when a CG overflows to the next one.
-                int usedDataFragsInCg;
-                if (perCgHighWater[cg] > 0)
-                {
-                    usedDataFragsInCg = perCgHighWater[cg] - dataStartFrag;
-                }
-                else
-                {
-                    usedDataFragsInCg = 0;
-                }
+                // The allocator is forward-only and starts CG > 0 at fragment 0, so the
+                // used space is [0, min(hw, sblkno)) plus [dataStartFrag, hw).
+                int sblkno = sb.SuperblockLocation;
+                int usedDataFragsInCg = Math.Max(0, perCgHighWater[cg] - dataStartFrag);
+                int lowUsedEnd = cg > 0 ? Math.Min(perCgHighWater[cg], sblkno) : 0;
 
                 // Patch CG header bitmaps and summary for all CGs
                 {
@@ -3204,10 +3206,9 @@ namespace UFS2Tool
                     int fragBitmapBytes = (fragsPerGroup + 7) / 8;
                     byte[] fragBitmap = new byte[fragBitmapBytes];
                     // Per FreeBSD mkfs.c initcg(): for CG > 0, blocks [0, sblkno) are free
-                    int sblkno = sb.SuperblockLocation;
                     if (cg > 0)
                     {
-                        for (int f = 0; f < sblkno && f < usableFragsInCg; f++)
+                        for (int f = lowUsedEnd; f < sblkno && f < usableFragsInCg; f++)
                         {
                             fragBitmap[f / 8] |= (byte)(1 << (f % 8));
                         }

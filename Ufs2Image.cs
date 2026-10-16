@@ -1206,7 +1206,9 @@ namespace UFS2Tool
 
                 // Search for a free block (fragsPerBlock consecutive free fragments)
                 int totalBlocks = cgNdblk / fragsPerBlock;
-                for (int blk = Superblock.DblkNo / fragsPerBlock; blk < totalBlocks; blk++)
+                // [0, sblkno) of CG > 0 is data space (FreeBSD initcg); the bitmap marks [sblkno, dblkno) used
+                int firstBlk = cgIndex > 0 ? 0 : Superblock.DblkNo / fragsPerBlock;
+                for (int blk = firstBlk; blk < totalBlocks; blk++)
                 {
                     int fragStart = blk * fragsPerBlock;
                     bool allFree = true;
