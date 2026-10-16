@@ -212,6 +212,17 @@ export DISPLAY=:0
 ## Notes
 
 - The CLI tool works on any Linux distribution supported by .NET 8.0.
-- Device operations (`devinfo`, `mount_udf`) are **Windows-only** and will not be available on Linux.
+- `devinfo` is **Windows-only**.
+- `mount_udf` uses FUSE on Linux: install fuse3 (`libfuse3` and `fusermount3`), then mount on an existing directory:
+  ```bash
+  mkdir -p ~/ufs
+  ufs2tool mount_udf myimage.img ~/ufs        # read-only, runs in the foreground
+  ufs2tool mount_udf -o rw myimage.img ~/ufs  # modify, truncate, delete, rename existing entries
+  ufs2tool umount_udf ~/ufs                   # or Ctrl+C in the mount_udf terminal
+  ```
+  As on Windows, new files and directories cannot be created through the mount.
+- The Linux kernel `ufs` driver (`mount -t ufs -o ufstype=ufs2`) only mounts filesystems with a fragment
+  size of 4096 bytes or less, and fails with `fragment size 65536 is too large` otherwise. Such images are
+  valid FFS and work on FreeBSD; on Linux use `mount_udf` instead. `newfs` warns when `-f` is above 4096.
 - All image file operations (create, inspect, extract, add, delete, replace, chmod, growfs, tunefs, fsck) work fully on Linux.
 - The GUI application requires a graphical environment (X11 or Wayland).

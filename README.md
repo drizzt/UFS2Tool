@@ -34,8 +34,8 @@ A complete implementation of FreeBSD's `newfs(8)`, `makefs(8)`, `tunefs(8)`, `gr
   - [stat](#stat--show-detailed-file-information)
   - [find](#find--search-for-files-by-name-pattern)
   - [du](#du--show-disk-usage)
-  - [mount_udf](#mount_udf--mount-ufs-image-as-windows-drive)
-  - [umount_udf](#umount_udf--unmount-a-ufs-drive)
+  - [mount_udf](#mount_udf--mount-ufs-image)
+  - [umount_udf](#umount_udf--unmount-a-ufs-image)
   - [devinfo](#devinfo--show-device-information)
 - [Examples](#-examples)
 - [PS5 Quick Start](#-ps5-quick-start)
@@ -64,7 +64,7 @@ A complete implementation of FreeBSD's `newfs(8)`, `makefs(8)`, `tunefs(8)`, `gr
 - **Rename files** or directories inside UFS1/UFS2 filesystem images
 - **Search for files** by name pattern with glob wildcards (`*`, `?`) and type filtering
 - **Disk usage analysis** similar to FreeBSD `du(1)` with human-readable sizes, depth limiting, and summary mode
-- **Mount UFS images** as Windows drives with read-write support via Dokan
+- **Mount UFS images** as Windows drives (Dokan) or Linux directories (FUSE) with read-write support
 - **Read and inspect** existing UFS1/UFS2 filesystem images
 - **List directory contents** from UFS1/UFS2 images
 - **Device I/O** — direct writing to physical drives and volumes on Windows
@@ -472,13 +472,13 @@ ufs2tool du myimage.img /subdir
 ufs2tool du -d 1 myimage.img
 ```
 
-### `mount_udf` — Mount UFS image as Windows drive
+### `mount_udf` — Mount UFS image
 
 ```
-ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter>
+ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter | directory>
 ```
 
-Mount a UFS1/UFS2 filesystem image as a Windows drive letter using the Dokan driver. Supports read-only (default) and read-write modes.
+Mount a UFS1/UFS2 filesystem image as a Windows drive letter using the Dokan driver, or on an existing directory on Linux using FUSE. Supports read-only (default) and read-write modes.
 
 | Option | Description |
 |--------|-------------|
@@ -495,17 +495,21 @@ ufs2tool mount_udf -o rw myimage.img X:
 
 # Unmount
 ufs2tool umount_udf X:
+
+# Linux
+ufs2tool mount_udf myimage.img ~/ufs
+ufs2tool umount_udf ~/ufs
 ```
 
-Requires the [Dokan driver](https://github.com/dokan-dev/dokany/releases) to be installed.
+Requires the [Dokan driver](https://github.com/dokan-dev/dokany/releases) on Windows, or fuse3 (`libfuse3`, `fusermount3`) on Linux.
 
-### `umount_udf` — Unmount a UFS drive
+### `umount_udf` — Unmount a UFS image
 
 ```
-ufs2tool umount_udf <drive-letter>
+ufs2tool umount_udf <drive-letter | directory>
 ```
 
-Unmount a previously mounted UFS filesystem drive. Alternatively, pressing Ctrl+C in the `mount_udf` terminal also cleanly unmounts.
+Unmount a previously mounted UFS filesystem (drive letter on Windows, directory on Linux via `fusermount3 -u`). Alternatively, pressing Ctrl+C in the `mount_udf` terminal also cleanly unmounts.
 
 ### `devinfo` — Show device information
 
@@ -718,7 +722,7 @@ For a detailed breakdown of the core library components, filesystem structures, 
 ## 📝 Notes
 
 - Device operations (`newfs` on physical drives, `devinfo`, `mount_udf`) require **Administrator privileges** on Windows.
-- The tool targets `net8.0` and uses conditional Windows-specific features for device I/O and Dokan mounting.
+- The tool targets `net8.0` and uses conditional Windows-specific features for device I/O and Dokan mounting, and FUSE (via FuseDotNet) for mounting on Linux.
 - Image file operations (create, inspect, extract, add, delete, replace, chmod, growfs, tunefs, fsck) work on any platform supported by .NET 8.0.
 - Filesystem images created by this tool are compatible with FreeBSD's `mount` and `fsck_ffs`.
 - When creating images with `makefs`, soft updates are disabled by default (`softupdates=0`), matching FreeBSD `makefs(8)` behavior. Use `-o softupdates=1` to enable them explicitly.
