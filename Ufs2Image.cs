@@ -1206,16 +1206,8 @@ namespace UFS2Tool
                 {
                     int fragStart = blk * fragsPerBlock;
                     bool allFree = true;
-                    for (int f = 0; f < fragsPerBlock; f++)
-                    {
-                        int byteIdx = freeoff + (fragStart + f) / 8;
-                        int bitIdx = (fragStart + f) % 8;
-                        if (byteIdx >= cgData.Length || (cgData[byteIdx] & (1 << bitIdx)) == 0)
-                        {
-                            allFree = false;
-                            break;
-                        }
-                    }
+                    for (int f = 0; f < fragsPerBlock && allFree; f++)
+                        allFree = IsFragFree(cgData, freeoff, fragStart + f);
 
                     if (allFree)
                     {
@@ -1223,23 +1215,7 @@ namespace UFS2Tool
                         for (int f = 0; f < fragsPerBlock; f++)
                             ClearFragBit(cgData, freeoff, fragStart + f);
 
-                        // Update CG free block count
-                        WriteCgInt32(cgData, 0x1C, cgNbfree - 1);
-
-                        // Update cluster bitmap
-                        if (Superblock.ContigSumSize > 0)
-                        {
-                            ClearClusterBit(cgData, blk);
-                            RecomputeClusterSummary(cgData, Superblock.ContigSumSize,
-                                cgNdblk / fragsPerBlock);
-                        }
-
-                        // Write CG back
-                        _stream.Position = cgHeaderOffset;
-                        _stream.Write(cgData, 0, cgData.Length);
-
-                        // Update superblock free counts
-                        Superblock.FreeBlocks--;
+                        WriteCg(cgIndex, cgHeaderOffset, cgData);
 
                         return cgStartFrag + fragStart;
                     }
@@ -1296,9 +1272,25 @@ namespace UFS2Tool
                 throw new InvalidOperationException($"Path '{fsPath}' is not a regular file.");
 
             long newSize = newData.Length;
-            long existingBlocks = CountAllocatedBlocks(inode);
-            long existingCapacity = existingBlocks * Superblock.BSize;
             long blocksNeeded = newSize == 0 ? 0 : (newSize + Superblock.BSize - 1) / Superblock.BSize;
+            long existingBlocks = CountAllocatedBlocks(inode);
+
+            // Shrinking: free every block and rewrite from scratch so no pointer
+            // past the new end survives (blocks there would leak and fail fsck_ffs).
+            // Growing past existing indirect blocks too: the extension below only
+            // fills empty direct slots and fresh indirect trees.
+            if (blocksNeeded < existingBlocks ||
+                (blocksNeeded > existingBlocks && existingBlocks > Ufs2Constants.NDirect))
+            {
+                FreeFileBlocks(inode);
+                inode.Size = 0;
+            }
+
+            if (ExpandTail(inode))
+                WriteInode(inodeNumber, inode);
+
+            existingBlocks = CountAllocatedBlocks(inode);
+            long existingCapacity = existingBlocks * Superblock.BSize;
 
             // Write data to existing blocks
             long written = 0;
@@ -1433,6 +1425,7 @@ namespace UFS2Tool
                 inode.Blocks += (1 + sindBlocks) * Superblock.FragsPerBlock * (Superblock.FSize / 512);
             }
 
+            TrimTail(inode);
             WriteInode(inodeNumber, inode);
 
             // Update and write superblock
@@ -1548,9 +1541,28 @@ namespace UFS2Tool
                         // Update CG free inode count
                         WriteCgInt32(cgData, 0x20, cgNifree - 1);
 
-                        // Write CG back
-                        _stream.Position = cgHeaderOffset;
-                        _stream.Write(cgData, 0, cgData.Length);
+                        // fsck_ffs treats UFS2 inodes at or past cg_initediblk as unallocated;
+                        // zero whole inode blocks up to this one, as FreeBSD ffs_nodealloccg does.
+                        int inited = ReadCgInt32(cgData, 0x78);
+                        if (Superblock.IsUfs2 && i >= inited)
+                        {
+                            int inodeSize = Ufs2Constants.Ufs2InodeSize;
+                            int inopb = Superblock.BSize / inodeSize;
+                            int newInited = Math.Min((i / inopb + 1) * inopb, inodesPerGroup);
+                            long tableStart = ((long)cgIndex * fragsPerGroup + Superblock.IblkNo) * Superblock.FSize;
+                            byte[] zeroInode = new byte[inodeSize];
+                            for (int j = inited; j < newInited; j++)
+                            {
+                                // Older versions of this tool allocated past cg_initediblk: keep those
+                                if (j != i && (cgData[iusedoff + j / 8] & (1 << (j % 8))) != 0)
+                                    continue;
+                                _stream.Position = tableStart + (long)j * inodeSize;
+                                _stream.Write(zeroInode);
+                            }
+                            WriteCgInt32(cgData, 0x78, newInited);
+                        }
+
+                        StoreCg(cgIndex, cgHeaderOffset, cgData);
 
                         // Update superblock
                         Superblock.FreeInodes--;
@@ -1603,9 +1615,7 @@ namespace UFS2Tool
                 WriteCgInt32(cgData, 0x18, cgNdir - 1);
             }
 
-            // Write CG back
-            _stream.Position = cgHeaderOffset;
-            _stream.Write(cgData, 0, cgData.Length);
+            StoreCg(cgIndex, cgHeaderOffset, cgData);
 
             // Update superblock
             Superblock.FreeInodes++;
@@ -1614,45 +1624,272 @@ namespace UFS2Tool
         }
 
         /// <summary>
-        /// Free a full block (all fragments) by marking them as free in the CG fragment bitmap.
+        /// Recompute a CG's free block/fragment counts, fragment summary and cluster map
+        /// from its free-fragment bitmap (as fsck_ffs pass 5 does), then write the CG and
+        /// its fs_csp summary entry. Superblock totals move by the change in this CG.
         /// </summary>
-        private void FreeBlock(long fragNumber)
+        private void WriteCg(int cgIndex, long cgHeaderOffset, byte[] cgData)
         {
             int fragsPerBlock = Superblock.FragsPerBlock;
-            int fragsPerGroup = Superblock.CylGroupSize;
-            int cgIndex = (int)(fragNumber / fragsPerGroup);
-            int localFrag = (int)(fragNumber % fragsPerGroup);
-
-            long cgStartFrag = (long)cgIndex * fragsPerGroup;
-            long cgHeaderOffset = cgStartFrag * Superblock.FSize + (long)Superblock.CblkNo * Superblock.FSize;
-
-            byte[] cgData = ReadCgBlock(cgHeaderOffset);
             int freeoff = ReadCgInt32(cgData, 0x60);
+            int cgNdblk = ReadCgInt32(cgData, 0x14);
+            bool clusters = Superblock.ContigSumSize > 0;
+            int nbfree = 0, nffree = 0;
+            var frsum = new int[8]; // MAXFRAG
 
-            // Mark all frags in the block as free (set bits)
-            for (int f = 0; f < fragsPerBlock; f++)
-                SetFragBit(cgData, freeoff, localFrag + f);
-
-            // Update CG free block count
-            int cgNbfree = ReadCgInt32(cgData, 0x1C);
-            WriteCgInt32(cgData, 0x1C, cgNbfree + 1);
-
-            // Update cluster bitmap if ContigSumSize > 0
-            if (Superblock.ContigSumSize > 0)
+            for (int blk = 0; blk * fragsPerBlock < cgNdblk; blk++)
             {
-                int blockIndex = localFrag / fragsPerBlock;
-                SetClusterBit(cgData, blockIndex);
-                int cgNdblk = ReadCgInt32(cgData, 0x14);
-                RecomputeClusterSummary(cgData, Superblock.ContigSumSize,
-                    cgNdblk / fragsPerBlock);
+                int frags = 0, run = 0;
+                for (int f = 0; f < fragsPerBlock; f++)
+                {
+                    int frag = blk * fragsPerBlock + f;
+                    if (frag < cgNdblk && IsFragFree(cgData, freeoff, frag))
+                    {
+                        frags++;
+                        run++;
+                        continue;
+                    }
+                    if (run > 0) frsum[run]++;
+                    run = 0;
+                }
+
+                if (frags == fragsPerBlock)
+                {
+                    nbfree++;
+                    if (clusters) SetClusterBit(cgData, blk);
+                }
+                else
+                {
+                    if (run > 0) frsum[run]++;
+                    nffree += frags;
+                    if (clusters) ClearClusterBit(cgData, blk);
+                }
             }
 
-            // Write CG back
+            Superblock.FreeBlocks += nbfree - ReadCgInt32(cgData, 0x1C);
+            Superblock.FreeFragments += nffree - ReadCgInt32(cgData, 0x24);
+            WriteCgInt32(cgData, 0x1C, nbfree);
+            WriteCgInt32(cgData, 0x24, nffree);
+            for (int i = 1; i < frsum.Length; i++)
+                WriteCgInt32(cgData, 0x34 + i * 4, frsum[i]);
+            if (clusters)
+                RecomputeClusterSummary(cgData, Superblock.ContigSumSize, cgNdblk / fragsPerBlock);
+
+            StoreCg(cgIndex, cgHeaderOffset, cgData);
+        }
+
+        /// <summary>
+        /// Write a CG and its fs_csp summary entry as is, for changes that leave the
+        /// free-fragment bitmap alone (inode and directory counts).
+        /// </summary>
+        private void StoreCg(int cgIndex, long cgHeaderOffset, byte[] cgData)
+        {
             _stream.Position = cgHeaderOffset;
             _stream.Write(cgData, 0, cgData.Length);
 
-            // Update superblock
-            Superblock.FreeBlocks++;
+            // cg_cs (0x18) has the same layout as this CG's struct csum entry
+            _stream.Position = Superblock.CsAddr * Superblock.FSize + (long)cgIndex * Ufs2Constants.CsumStructSize;
+            _stream.Write(cgData, 0x18, Ufs2Constants.CsumStructSize);
+        }
+
+        /// <summary>
+        /// Set or clear (free = true/false) count fragments starting at fragNumber in
+        /// their CG's free-fragment bitmap. All fragments must lie in one block.
+        /// </summary>
+        private void MarkFrags(long fragNumber, int count, bool free)
+        {
+            int cgIndex = (int)(fragNumber / Superblock.CylGroupSize);
+            int localFrag = (int)(fragNumber % Superblock.CylGroupSize);
+            long cgHeaderOffset = CgHeaderOffset(cgIndex);
+
+            byte[] cgData = ReadCgBlock(cgHeaderOffset);
+            int freeoff = ReadCgInt32(cgData, 0x60);
+            for (int f = 0; f < count; f++)
+            {
+                if (free)
+                    SetFragBit(cgData, freeoff, localFrag + f);
+                else
+                    ClearFragBit(cgData, freeoff, localFrag + f);
+            }
+
+            WriteCg(cgIndex, cgHeaderOffset, cgData);
+        }
+
+        /// <summary>
+        /// Mark count fragments starting at fragNumber used if all of them are free.
+        /// Returns false, changing nothing, otherwise.
+        /// </summary>
+        private bool TryClaimFrags(long fragNumber, int count)
+        {
+            int cgIndex = (int)(fragNumber / Superblock.CylGroupSize);
+            int localFrag = (int)(fragNumber % Superblock.CylGroupSize);
+            long cgHeaderOffset = CgHeaderOffset(cgIndex);
+            byte[] cgData = ReadCgBlock(cgHeaderOffset);
+            int freeoff = ReadCgInt32(cgData, 0x60);
+            int cgNdblk = ReadCgInt32(cgData, 0x14);
+            for (int f = localFrag; f < localFrag + count; f++)
+            {
+                if (f >= cgNdblk || !IsFragFree(cgData, freeoff, f))
+                    return false;
+            }
+            for (int f = localFrag; f < localFrag + count; f++)
+                ClearFragBit(cgData, freeoff, f);
+            WriteCg(cgIndex, cgHeaderOffset, cgData);
+            return true;
+        }
+
+        private long CgHeaderOffset(int cgIndex) =>
+            ((long)cgIndex * Superblock.CylGroupSize + Superblock.CblkNo) * Superblock.FSize;
+
+        /// <summary>
+        /// Free a full block (all fragments) by marking them as free in the CG fragment bitmap.
+        /// </summary>
+        private void FreeBlock(long fragNumber) => MarkFrags(fragNumber, Superblock.FragsPerBlock, free: true);
+
+        /// <summary>
+        /// Number of fragments direct block lbn holds for a file of the given size
+        /// (FreeBSD blksize()): only the last direct block may be a partial block.
+        /// </summary>
+        private int DirectBlockFrags(long size, int lbn)
+        {
+            long rem = size - (long)lbn * Superblock.BSize;
+            if (rem <= 0 || rem >= Superblock.BSize)
+                return Superblock.FragsPerBlock;
+            return (int)((rem + Superblock.FSize - 1) / Superblock.FSize);
+        }
+
+        /// <summary>
+        /// Fragments held by the inode's last direct block when that is a partial
+        /// block, else 0 (full block, empty file, or data past the direct blocks).
+        /// </summary>
+        private int PartialTailFrags(Ufs2Inode inode, out int lbn)
+        {
+            lbn = (int)((inode.Size - 1) / Superblock.BSize);
+            if (inode.Size <= 0 || inode.Size > (long)Ufs2Constants.NDirect * Superblock.BSize)
+                return 0;
+            int frags = DirectBlockFrags(inode.Size, lbn);
+            return frags == Superblock.FragsPerBlock ? 0 : frags;
+        }
+
+        /// <summary>
+        /// Grow the inode's partial last direct block to a full block, in place when the
+        /// following fragments are free, otherwise by moving it to a new block. The
+        /// in-place write paths assume full blocks; TrimTail undoes this afterwards.
+        /// Returns true if the inode changed.
+        /// </summary>
+        private bool ExpandTail(Ufs2Inode inode)
+        {
+            int have = PartialTailFrags(inode, out int lbn);
+            if (have == 0)
+                return false;
+            int fragsPerBlock = Superblock.FragsPerBlock;
+
+            long frag = inode.DirectBlocks[lbn];
+            if (frag % fragsPerBlock != 0 || !TryClaimFrags(frag + have, fragsPerBlock - have))
+            {
+                long blk = AllocateBlock((int)(frag / Superblock.CylGroupSize));
+                if (blk < 0)
+                    throw new InvalidOperationException("No free blocks available to extend a fragment tail.");
+                byte[] data = new byte[Superblock.BSize];
+                _stream.Position = frag * Superblock.FSize;
+                ReadFully(data, 0, have * Superblock.FSize);
+                _stream.Position = blk * Superblock.FSize;
+                _stream.Write(data, 0, data.Length);
+                MarkFrags(frag, have, free: true);
+                inode.DirectBlocks[lbn] = blk;
+            }
+
+            inode.Blocks += (fragsPerBlock - have) * (Superblock.FSize / 512);
+            return true;
+        }
+
+        /// <summary>
+        /// Free the fragments past the end of the file in its last direct block, which
+        /// must currently be a full block. The tail moves into an existing free fragment
+        /// run when one fits (FreeBSD ffs_realloccg), else it is trimmed in place.
+        /// Returns true if the inode changed.
+        /// </summary>
+        private bool TrimTail(Ufs2Inode inode)
+        {
+            int need = PartialTailFrags(inode, out int lbn);
+            if (need == 0)
+                return false;
+            int fragsPerBlock = Superblock.FragsPerBlock;
+
+            long blk = inode.DirectBlocks[lbn];
+            long run = FindFragRun(need, (int)(blk / Superblock.CylGroupSize));
+            if (run >= 0)
+            {
+                byte[] data = new byte[need * Superblock.FSize];
+                _stream.Position = blk * Superblock.FSize;
+                ReadFully(data, 0, data.Length);
+                _stream.Position = run * Superblock.FSize;
+                _stream.Write(data, 0, data.Length);
+                MarkFrags(run, need, free: false);
+                FreeBlock(blk);
+                inode.DirectBlocks[lbn] = run;
+            }
+            else
+            {
+                MarkFrags(blk + need, fragsPerBlock - need, free: true);
+            }
+            inode.Blocks -= (fragsPerBlock - need) * (Superblock.FSize / 512);
+            return true;
+        }
+
+        /// <summary>
+        /// Find the smallest run of at least count free fragments inside a partially
+        /// used block (FreeBSD ffs_alloccg/ffs_mapsearch), searching from preferredCg.
+        /// Returns the absolute fragment number of the run start, or -1. Marks nothing.
+        /// </summary>
+        private long FindFragRun(int count, int preferredCg)
+        {
+            int fragsPerBlock = Superblock.FragsPerBlock;
+            int fragsPerGroup = Superblock.CylGroupSize;
+
+            for (int attempt = 0; attempt < Superblock.NumCylGroups; attempt++)
+            {
+                int cgIndex = (preferredCg + attempt) % Superblock.NumCylGroups;
+                long cgStartFrag = (long)cgIndex * fragsPerGroup;
+                byte[] cgData = ReadCgBlock(CgHeaderOffset(cgIndex));
+
+                // cg_frsum[i] counts free runs of exactly i frags in partial blocks
+                bool fits = false;
+                for (int i = count; i < fragsPerBlock && !fits; i++)
+                    fits = ReadCgInt32(cgData, 0x34 + i * 4) > 0;
+                if (!fits) continue;
+
+                int freeoff = ReadCgInt32(cgData, 0x60);
+                int cgNdblk = ReadCgInt32(cgData, 0x14);
+                int firstBlk = cgIndex > 0 ? 0 : Superblock.DblkNo / fragsPerBlock;
+                int bestStart = -1, bestLen = int.MaxValue;
+                for (int blk = firstBlk; blk * fragsPerBlock < cgNdblk; blk++)
+                {
+                    int run = 0;
+                    for (int f = 0; f <= fragsPerBlock; f++)
+                    {
+                        int frag = blk * fragsPerBlock + f;
+                        if (f < fragsPerBlock && frag < cgNdblk && IsFragFree(cgData, freeoff, frag))
+                        {
+                            run++;
+                            continue;
+                        }
+                        // run == fragsPerBlock is a whole free block: left for AllocateBlock
+                        if (run >= count && run < fragsPerBlock && run < bestLen)
+                        {
+                            bestStart = frag - run;
+                            bestLen = run;
+                        }
+                        run = 0;
+                    }
+                    if (bestLen == count) break;
+                }
+
+                if (bestStart >= 0)
+                    return cgStartFrag + bestStart;
+            }
+
+            return -1;
         }
 
         /// <summary>
@@ -1660,12 +1897,16 @@ namespace UFS2Tool
         /// </summary>
         private void FreeFileBlocks(Ufs2Inode inode)
         {
+            // A short symlink keeps its target inline in the block pointers (FreeBSD ffs_truncate)
+            if (inode.IsSymlink && (inode.Size < Superblock.MaxSymlinkLen || inode.Blocks == 0))
+                return;
+
             // Free direct blocks
             for (int i = 0; i < Ufs2Constants.NDirect; i++)
             {
                 if (inode.DirectBlocks[i] != 0)
                 {
-                    FreeBlock(inode.DirectBlocks[i]);
+                    MarkFrags(inode.DirectBlocks[i], DirectBlockFrags(inode.Size, i), free: true);
                     inode.DirectBlocks[i] = 0;
                 }
             }
@@ -1726,6 +1967,25 @@ namespace UFS2Tool
         /// Add a directory entry to a directory inode.
         /// </summary>
         private void AddDirectoryEntry(uint dirInodeNumber, string name, uint entryInodeNumber, byte fileType)
+        {
+            var dirInode = ReadInode(dirInodeNumber);
+            if (dirInode.IsDirectory && ExpandTail(dirInode))
+                WriteInode(dirInodeNumber, dirInode);
+
+            try
+            {
+                AddDirectoryEntryToFullBlocks(dirInodeNumber, name, entryInodeNumber, fileType);
+            }
+            finally
+            {
+                // Trim on failure too: a full block past di_size fails fsck_ffs pass 5
+                dirInode = ReadInode(dirInodeNumber);
+                if (dirInode.IsDirectory && TrimTail(dirInode))
+                    WriteInode(dirInodeNumber, dirInode);
+            }
+        }
+
+        private void AddDirectoryEntryToFullBlocks(uint dirInodeNumber, string name, uint entryInodeNumber, byte fileType)
         {
             var dirInode = ReadInode(dirInodeNumber);
             if (!dirInode.IsDirectory)
@@ -1908,6 +2168,8 @@ namespace UFS2Tool
                     {
                         long[] ptrs = [newBlockFrag];
                         dirInode.IndirectBlocks[0] = AllocateIndirectBlock(ptrs, 1, cgIndex);
+                        // di_blocks counts the indirect block too
+                        dirInode.Blocks += Superblock.FragsPerBlock * (Superblock.FSize / 512);
                     }
                     else
                     {
@@ -1922,7 +2184,8 @@ namespace UFS2Tool
                 }
             }
 
-            dirInode.Size += blockSize;
+            // Grow by one DIRBLKSIZ like FreeBSD: zeroed regions past it would read as corrupt
+            dirInode.Size = (long)nextSlot * blockSize + dirBlkSize;
             dirInode.Blocks += Superblock.FragsPerBlock * (Superblock.FSize / 512);
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -2017,11 +2280,11 @@ namespace UFS2Tool
                 if (blockFrag == 0) continue;
 
                 long blockOffset = blockFrag * Superblock.FSize;
+                // Only di_size bytes: the last block may be a fragment tail
+                long bytesInBlock = Math.Min(blockSize, dirSize - (long)bi * blockSize);
                 byte[] blockData = new byte[blockSize];
                 _stream.Position = blockOffset;
-                ReadFully(blockData, 0, blockSize);
-
-                long bytesInBlock = Math.Min(blockSize, dirSize - (long)bi * blockSize);
+                ReadFully(blockData, 0, (int)bytesInBlock);
 
                 // Scan through DIRBLKSIZ regions
                 for (int dbStart = 0; dbStart < (int)bytesInBlock; dbStart += dirBlkSize)
@@ -2061,7 +2324,7 @@ namespace UFS2Tool
 
                             // Write block back
                             _stream.Position = blockOffset;
-                            _stream.Write(blockData, 0, blockSize);
+                            _stream.Write(blockData, 0, (int)bytesInBlock);
                             return;
                         }
 
@@ -2209,6 +2472,7 @@ namespace UFS2Tool
                 inode.Blocks += (1 + sindBlocks) * Superblock.FragsPerBlock * (Superblock.FSize / 512);
             }
 
+            TrimTail(inode);
             WriteInode((uint)newIno, inode);
 
             // Add directory entry in parent
@@ -2289,6 +2553,7 @@ namespace UFS2Tool
             _stream.Position = blk * Superblock.FSize;
             _stream.Write(blockData, 0, Superblock.BSize);
 
+            TrimTail(inode);
             WriteInode((uint)newIno, inode);
 
             // Add directory entry in parent
@@ -2307,8 +2572,7 @@ namespace UFS2Tool
             byte[] cgData = ReadCgBlock(newCgHeaderOffset);
             int cgNdir = ReadCgInt32(cgData, 0x18);
             WriteCgInt32(cgData, 0x18, cgNdir + 1);
-            _stream.Position = newCgHeaderOffset;
-            _stream.Write(cgData, 0, cgData.Length);
+            StoreCg(newCg, newCgHeaderOffset, cgData);
 
             // Update superblock
             Superblock.Directories++;
@@ -3091,6 +3355,9 @@ namespace UFS2Tool
             if (byteIdx < cgData.Length)
                 cgData[byteIdx] |= (byte)(1 << bitIdx);
         }
+
+        private static bool IsFragFree(byte[] cgData, int freeoff, int fragIndex) =>
+            (cgData[freeoff + fragIndex / 8] & (1 << (fragIndex % 8))) != 0;
 
         private static void ClearFragBit(byte[] cgData, int freeoff, int fragIndex)
         {
