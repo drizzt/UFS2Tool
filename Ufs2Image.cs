@@ -11,6 +11,7 @@ namespace UFS2Tool
         private FileStream _stream;
         private BinaryReader _reader;
         private BinaryWriter? _writer;
+        private long _primarySbOffset;
 
         /// <summary>
         /// Gets the BinaryWriter, throwing if the image was opened read-only.
@@ -37,7 +38,7 @@ namespace UFS2Tool
         /// the backup superblock locations printed by newfs/growfs). Mirrors
         /// FreeBSD's <c>fsck_ffs -b block</c> behavior. When
         /// <paramref name="altSuperblockSector"/> is negative the primary superblock
-        /// at <see cref="Ufs2Constants.SuperblockOffset"/> is used.
+        /// (SBLOCK_UFS2, or SBLOCK_UFS1 for UFS1) is used.
         /// </summary>
         public Ufs2Image(string imagePath, bool readOnly, long altSuperblockSector)
         {
@@ -52,9 +53,10 @@ namespace UFS2Tool
 
             try
             {
+                _primarySbOffset = Ufs2Superblock.FindPrimaryOffset(_stream);
                 long sbOffset = altSuperblockSector >= 0
                     ? altSuperblockSector * Ufs2Constants.DefaultSectorSize
-                    : Ufs2Constants.SuperblockOffset;
+                    : _primarySbOffset;
                 ReadSuperblock(sbOffset);
             }
             catch
@@ -66,7 +68,7 @@ namespace UFS2Tool
             }
         }
 
-        private void ReadSuperblock(long offset = Ufs2Constants.SuperblockOffset)
+        private void ReadSuperblock(long offset)
         {
             if (offset < 0 || offset + Ufs2Constants.SuperblockSize > _stream.Length)
                 throw new InvalidDataException(
@@ -390,7 +392,7 @@ namespace UFS2Tool
             if (IsReadOnly)
                 throw new InvalidOperationException("Cannot write superblock: image is opened read-only.");
 
-            _stream.Position = Ufs2Constants.SuperblockOffset;
+            _stream.Position = _primarySbOffset;
             Superblock.WriteTo(Writer);
             Writer.Flush();
         }
@@ -3024,7 +3026,7 @@ namespace UFS2Tool
             sb.MountPoint = "";
 
             // Write primary superblock
-            _stream.Position = Ufs2Constants.SuperblockOffset;
+            _stream.Position = _primarySbOffset;
             sb.WriteTo(Writer);
             Writer.Flush();
 
@@ -3046,7 +3048,7 @@ namespace UFS2Tool
             Writer.Flush();
 
             // Re-read to update in-memory state
-            ReadSuperblock();
+            ReadSuperblock(_primarySbOffset);
 
             Console.WriteLine($"growfs: filesystem grown to {newSizeBytes / (1024 * 1024)} MB " +
                 $"({newTotalFrags} frags, {newNumCg} cylinder groups).");
@@ -3237,6 +3239,12 @@ namespace UFS2Tool
             WriteCgInt32(cgData, 0x08, (int)(timestamp & 0xFFFFFFFF));
             WriteCgInt32(cgData, 0x0C, cgIndex);
             WriteCgInt32(cgData, 0x14, ndblk);
+            if (magic == Ufs2Constants.Ufs1Magic)
+            {
+                // cg_old_ncyl = fs_old_cpg (1), cg_old_niblk = fs_ipg (both int16), per FreeBSD initcg
+                BitConverter.TryWriteBytes(cgData.AsSpan(0x10), (short)1);
+                BitConverter.TryWriteBytes(cgData.AsSpan(0x12), (short)inodesPerGroup);
+            }
 
             int freeInodes = inodesPerGroup;
             // For CG > 0: boot area [0, sblkno) is free
@@ -3265,8 +3273,8 @@ namespace UFS2Tool
             WriteCgInt32(cgData, 0x6C, clusteroff);
             WriteCgInt32(cgData, 0x70, nclusterblks);
 
-            // cg_niblk
-            WriteCgInt32(cgData, 0x74, inodesPerGroup);
+            // cg_niblk (UFS1 uses cg_old_niblk and leaves this 0)
+            WriteCgInt32(cgData, 0x74, magic == Ufs2Constants.Ufs2Magic ? inodesPerGroup : 0);
 
             // cg_initediblk
             int inodesPerBlk = blockSize / inodeSize;

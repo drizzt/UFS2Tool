@@ -136,8 +136,8 @@ namespace UFS2Tool
             bw.Write(MinFreePercent);
             // fs_old_rotdelay (0x040)
             bw.Write(0);
-            // fs_old_rps (0x044)
-            bw.Write(0);
+            // fs_old_rps (0x044): FreeBSD newfs sets 60 for UFS1, 0 for UFS2
+            bw.Write(IsUfs1 ? 60 : 0);
 
             // fs_bmask (0x048)
             bw.Write(BMask);
@@ -179,10 +179,11 @@ namespace UFS2Tool
 
             // fs_optim (0x080)
             bw.Write(Optimization);
-            // fs_old_npsect (0x084)
-            bw.Write(0);
-            // fs_old_interleave (0x088)
-            bw.Write(0);
+            // fs_old_npsect (0x084): UFS1 fakes one cylinder per CG, so npsect = nsect = spc = fpg * nspf
+            int oldSpc = IsUfs1 ? CylGroupSize * (FSize / sectorSize) : 0;
+            bw.Write(oldSpc);
+            // fs_old_interleave (0x088): 1 for UFS1, 0 for UFS2
+            bw.Write(IsUfs1 ? 1 : 0);
             // fs_old_trackskew (0x08C)
             bw.Write(0);
 
@@ -200,9 +201,9 @@ namespace UFS2Tool
             // fs_spare2 (0x0A4)
             bw.Write(0);
             // fs_old_nsect (0x0A8)
-            bw.Write(0);
+            bw.Write(oldSpc);
             // fs_old_spc (0x0AC)
-            bw.Write(0);
+            bw.Write(oldSpc);
 
             // fs_old_ncyl (0x0B0)
             bw.Write(NumCylGroups);
@@ -343,8 +344,8 @@ namespace UFS2Tool
 
             // fs_state (0x548)
             bw.Write(0);
-            // fs_old_postblformat (0x54C)
-            bw.Write(Ufs2Constants.FsDynamicPostblFmt);
+            // fs_old_postblformat (0x54C): FS_DYNAMICPOSTBLFMT for UFS1, 0 for UFS2
+            bw.Write(IsUfs1 ? Ufs2Constants.FsDynamicPostblFmt : 0);
             // fs_old_nrpos (0x550)
             bw.Write(1);
             // fs_spare5[0] (0x554)
@@ -519,6 +520,32 @@ namespace UFS2Tool
                 sb.Time = oldTime;
 
             return sb;
+        }
+
+        /// <summary>
+        /// Byte offset of the primary superblock, probed like FreeBSD ffs_sbsearch/readsuper:
+        /// SBLOCK_UFS2 first, where a UFS1 superblock with a 64K block size is skipped (it is
+        /// CG 0's backup there), then SBLOCK_UFS1. Returns SBLOCK_UFS2 if neither matches,
+        /// which is where older versions of this tool put the UFS1 superblock.
+        /// </summary>
+        public static long FindPrimaryOffset(Stream stream)
+        {
+            var reader = new BinaryReader(stream);
+            int Int32At(long offset, int field)
+            {
+                if (offset + Ufs2Constants.SuperblockSize > stream.Length) return 0;
+                stream.Position = offset + field;
+                return reader.ReadInt32();
+            }
+
+            int magic = Int32At(Ufs2Constants.SuperblockOffset, 0x55C); // fs_magic
+            if (magic == Ufs2Constants.Ufs2Magic ||
+                (magic == Ufs2Constants.Ufs1Magic &&
+                 Int32At(Ufs2Constants.SuperblockOffset, 0x30) != Ufs2Constants.SuperblockOffset)) // fs_bsize
+                return Ufs2Constants.SuperblockOffset;
+            if (Int32At(Ufs2Constants.Ufs1SuperblockOffset, 0x55C) == Ufs2Constants.Ufs1Magic)
+                return Ufs2Constants.Ufs1SuperblockOffset;
+            return Ufs2Constants.SuperblockOffset;
         }
 
         public bool IsValid => Magic == Ufs2Constants.Ufs2Magic || Magic == Ufs2Constants.Ufs1Magic;

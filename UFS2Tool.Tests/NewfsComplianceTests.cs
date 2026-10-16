@@ -209,10 +209,10 @@ namespace UFS2Tool.Tests
             int oldCpg = reader.ReadInt32();
             Assert.Equal(1, oldCpg);
 
-            // fs_old_postblformat (0x54C) should be -1 (FS_DYNAMICPOSTBLFMT)
+            // fs_old_postblformat (0x54C) is 0 for UFS2, as FreeBSD newfs leaves it
             fs.Position = Ufs2Constants.SuperblockOffset + 0x54C;
             int oldPostblFmt = reader.ReadInt32();
-            Assert.Equal(Ufs2Constants.FsDynamicPostblFmt, oldPostblFmt);
+            Assert.Equal(0, oldPostblFmt);
 
             // fs_old_nrpos (0x550) should be 1
             int oldNrpos = reader.ReadInt32();
@@ -1071,6 +1071,54 @@ namespace UFS2Tool.Tests
         }
 
         /// <summary>
+        /// UFS1 must keep its superblock at SBLOCK_UFS1 with the legacy fields FreeBSD
+        /// validate_sblock and the UFS1 cylinder group checks in fsck_ffs require.
+        /// </summary>
+        [Fact]
+        public void Ufs1_SuperblockAndCgLegacyFieldsMatchFreeBsd()
+        {
+            var creator = new Ufs2ImageCreator { FilesystemFormat = 1, BlockSize = 32768, FragmentSize = 4096 };
+            creator.CreateImage(_imagePath, 64 * 1024 * 1024);
+
+            using (var fs = new FileStream(_imagePath, FileMode.Open, FileAccess.Read))
+            using (var reader = new BinaryReader(fs))
+            {
+                Assert.Equal(Ufs2Constants.Ufs1SuperblockOffset, Ufs2Superblock.FindPrimaryOffset(fs));
+                fs.Position = Ufs2Constants.SuperblockOffset + 0x55C;
+                Assert.NotEqual(Ufs2Constants.Ufs1Magic, reader.ReadInt32());
+
+                fs.Position = Ufs2Constants.Ufs1SuperblockOffset;
+                var sb = Ufs2Superblock.ReadFrom(reader);
+                Assert.True(sb.IsUfs1);
+                Assert.Equal(Ufs2Constants.Ufs1SuperblockOffset, sb.SbBlockLoc);
+                Assert.Equal(-1, sb.CgMask);
+
+                int I(int off) { fs.Position = Ufs2Constants.Ufs1SuperblockOffset + off; return reader.ReadInt32(); }
+                int spc = sb.CylGroupSize * I(0x7C); // fpg * fs_old_nspf
+                Assert.Equal(60, I(0x44));             // fs_old_rps
+                Assert.Equal(spc, I(0x84));            // fs_old_npsect
+                Assert.Equal(1, I(0x88));              // fs_old_interleave
+                Assert.Equal(spc, I(0xA8));            // fs_old_nsect
+                Assert.Equal(spc, I(0xAC));            // fs_old_spc
+                Assert.Equal(Ufs2Constants.FsDynamicPostblFmt, I(0x54C));
+
+                for (int cg = 0; cg < sb.NumCylGroups; cg++)
+                {
+                    fs.Position = ((long)cg * sb.CylGroupSize + sb.CblkNo) * sb.FSize + 0x10;
+                    Assert.Equal(1, reader.ReadInt16());                  // cg_old_ncyl
+                    Assert.Equal(sb.InodesPerGroup, reader.ReadInt16());  // cg_old_niblk
+                    fs.Position += 0x74 - 0x14;
+                    Assert.Equal(0, reader.ReadInt32());                  // cg_niblk
+                    Assert.Equal(0, reader.ReadInt32());                  // cg_initediblk
+                }
+            }
+
+            using var image = new Ufs2Image(_imagePath, readOnly: true);
+            Assert.True(image.Superblock.IsUfs1);
+            Assert.True(image.FsckUfs().Clean);
+        }
+
+        /// <summary>
         /// Cylinder group geometry must follow FreeBSD mkfs.c sizing; -N output and the
         /// written superblock must agree. 14657 MB is from FreeBSD 15.1 newfs -N
         /// ("4 cylinder groups of 3664.31MB, 58629 blks, 14848 inodes"); the others
@@ -1082,6 +1130,7 @@ namespace UFS2Tool.Tests
         [InlineData(2, 1L << 30, 16384, 2048, 0, 7, 9930 * 8, 39744)]
         [InlineData(2, 1L << 30, 32768, 4096, 0, 4, 8193 * 8, 32896)]
         [InlineData(2, 1L << 30, 4096, 512, 0, 111, 2369 * 8, 9488)]
+        [InlineData(1, 1L << 30, 16384, 2048, 0, 9, 8159 * 8, 32640)]
         public void CylinderGroupGeometry_MatchesFreeBsdNewfs(
             int format, long size, int bsize, int fsize, int density, int ncg, int fpg, int ipg)
         {

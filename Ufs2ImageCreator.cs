@@ -108,6 +108,12 @@ namespace UFS2Tool
             (FilesystemFormat == 1) ? Ufs2Constants.Ufs1Magic : Ufs2Constants.Ufs2Magic;
 
         /// <summary>
+        /// Primary superblock byte offset (fs_sblockloc) for the selected filesystem format.
+        /// </summary>
+        private int SuperblockOffsetForFormat =>
+            (FilesystemFormat == 1) ? Ufs2Constants.Ufs1SuperblockOffset : Ufs2Constants.SuperblockOffset;
+
+        /// <summary>
         /// Validates the block size and fragment size parameters against FreeBSD newfs constraints.
         /// </summary>
         public void ValidateParameters()
@@ -484,7 +490,7 @@ namespace UFS2Tool
             int inopb = BlockSize / InodeSizeForFormat;
             int inopf = inopb / frag;
             int sblkno = AlignUpInt(
-                (Ufs2Constants.SuperblockOffset + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize, frag);
+                (SuperblockOffsetForFormat + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize, frag);
             int cblkno = sblkno + AlignUpInt((Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize, frag);
             int iblkno = cblkno + frag;
             // -c is compared against fs_fpg (fragments) exactly as FreeBSD does
@@ -570,7 +576,7 @@ namespace UFS2Tool
             // Compute CG layout offsets per FreeBSD mkfs.c formulas
             // fs_sblkno: first fragment after boot area + superblock, block-aligned
             int sblkno = AlignUpInt(
-                (Ufs2Constants.SuperblockOffset + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize,
+                (SuperblockOffsetForFormat + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize,
                 fragsPerBlock);
             // fs_cblkno: CG header follows superblock backup area
             int cblkno = sblkno + AlignUpInt(
@@ -586,9 +592,14 @@ namespace UFS2Tool
 
             // A CG must hold its metadata, and CG 0 also the csum area and root directory
             // (FreeBSD mkfs minfpg). Small fsize puts dblkno past what a tiny group holds.
+            // UFS1 must also keep backup superblocks off SBLOCK_UFS2: FreeBSD's superblock
+            // search would take that backup for the primary.
+            int sbUfs2Frag = Ufs2Constants.SuperblockOffset / FragmentSize;
             while (fragsPerGroup < dblkno
                    + AlignUpInt(numCylGroups * Ufs2Constants.CsumStructSize, BlockSize) / FragmentSize
-                   + fragsPerBlock)
+                   + fragsPerBlock
+                   || (FilesystemFormat == 1 && sbUfs2Frag > sblkno
+                       && (sbUfs2Frag - sblkno) % fragsPerGroup == 0))
             {
                 fragsPerGroup += fragsPerBlock;
                 numCylGroups = Math.Max(1, (int)((totalFrags + fragsPerGroup - 1) / fragsPerGroup));
@@ -711,7 +722,8 @@ namespace UFS2Tool
                 QFMask = ~((long)fmask),
                 OldInodeFmt = Ufs2Constants.Fs44InodeFmt,
                 MaxFileSize = maxFileSize,
-                SbBlockLoc = Ufs2Constants.SuperblockOffset,
+                SbBlockLoc = SuperblockOffsetForFormat,
+                CgMask = FilesystemFormat == 1 ? -1 : 0, // fs_old_cgmask: FreeBSD newfs sets 0xffffffff for UFS1
                 MaxBSize = maxBSize,
                 ContigSumSize = contigSumSize,
                 // fs_providersize: size of underlying provider in fragments
@@ -724,7 +736,7 @@ namespace UFS2Tool
 
             // Write primary superblock
             byte[] sbData = SerializeSuperblock(superblock);
-            target.WriteAligned(sbData, Ufs2Constants.SuperblockOffset);
+            target.WriteAligned(sbData, SuperblockOffsetForFormat);
 
             // Write UFS2 recovery information block (struct fsrecovery).
             // Per FreeBSD sbin/newfs/mkfs.c: the last 20 bytes of the sector
@@ -853,7 +865,7 @@ namespace UFS2Tool
             // but only accumulates cs_ndir/cs_nbfree/cs_nifree/cs_nffree — cs_numclusters
             // stays 0. FreeBSD's newfs also does not set cs_numclusters in fs_cstotal.
             sbData = SerializeSuperblock(superblock);
-            target.WriteAligned(sbData, Ufs2Constants.SuperblockOffset);
+            target.WriteAligned(sbData, SuperblockOffsetForFormat);
 
             // Update backup superblocks with final counts
             for (int cg = 1; cg < numCylGroups; cg++)
@@ -1018,11 +1030,10 @@ namespace UFS2Tool
             bw.Write((int)(timestamp & 0xFFFFFFFF));
             // cg_cgx (0x0C) — cylinder group index
             bw.Write(cgIndex);
-            // cg_old_ncyl (0x10)
-            bw.Write((short)0);
+            // cg_old_ncyl (0x10): UFS2: 0; UFS1: fs_old_cpg (1)
+            bw.Write((short)(MagicForFormat == Ufs2Constants.Ufs1Magic ? 1 : 0));
             // cg_old_niblk (0x12) — UFS2: 0 (per fsck_ffs pass5.c); UFS1: fs_ipg
-            bw.Write((short)(MagicForFormat == Ufs2Constants.Ufs1Magic
-                ? inodesInCg / (BlockSize / inodeSize) : 0));
+            bw.Write((short)(MagicForFormat == Ufs2Constants.Ufs1Magic ? inodesInCg : 0));
             // cg_ndblk (0x14) — number of data blocks in this CG
             bw.Write(totalFragsInCg);
 
@@ -1079,8 +1090,8 @@ namespace UFS2Tool
             // cg_nclusterblks (0x70)
             bw.Write(nclusterblks);
 
-            // cg_niblk (0x74) — actual number of inode blocks
-            bw.Write(inodesInCg);
+            // cg_niblk (0x74): UFS2: fs_ipg; UFS1: 0 (it uses cg_old_niblk)
+            bw.Write(MagicForFormat == Ufs2Constants.Ufs2Magic ? inodesInCg : 0);
 
             // cg_initediblk (0x78) — number of initialized inodes
             // Per FreeBSD mkfs.c initcg(): UFS2 uses MIN(ipg, 2 * INOPB) for lazy
@@ -1785,7 +1796,7 @@ namespace UFS2Tool
                 int inodesPerBlock = BlockSize / inodeSize;
 
                 int sblkno = AlignUpInt(
-                    (Ufs2Constants.SuperblockOffset + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize,
+                    (SuperblockOffsetForFormat + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize,
                     fragsPerBlock);
                 int cblkno = sblkno + AlignUpInt(
                     (Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize,
@@ -1824,10 +1835,7 @@ namespace UFS2Tool
                 int csSize = AlignUpInt(estNumCGs * Ufs2Constants.CsumStructSize, FragmentSize);
 
                 // Fixed overhead: primary superblock area + CG summary + root directory block
-                int sblockOffset = (FilesystemFormat == 1)
-                    ? Ufs2Constants.SuperblockSize
-                    : Ufs2Constants.SuperblockOffset;
-                long fixedOverhead = AlignUp(sblockOffset + Ufs2Constants.SuperblockSize, BlockSize)
+                long fixedOverhead = AlignUp(SuperblockOffsetForFormat + Ufs2Constants.SuperblockSize, BlockSize)
                                    + csSize
                                    + BlockSize;
 
@@ -1911,7 +1919,7 @@ namespace UFS2Tool
             using var writer = new BinaryWriter(fs);
 
             // Read existing superblock
-            fs.Position = Ufs2Constants.SuperblockOffset;
+            fs.Position = Ufs2Superblock.FindPrimaryOffset(fs);
             var sb = Ufs2Superblock.ReadFrom(reader);
 
             int fragsPerBlock = sb.BSize / sb.FSize;
@@ -3425,7 +3433,7 @@ namespace UFS2Tool
             // stays 0. FreeBSD's newfs also does not set cs_numclusters in fs_cstotal.
 
             byte[] sbData = SerializeSuperblock(sb);
-            fs.Position = Ufs2Constants.SuperblockOffset;
+            fs.Position = Ufs2Superblock.FindPrimaryOffset(fs);
             fs.Write(sbData, 0, sbData.Length);
 
             // Update backup superblocks in each CG (CG > 0)

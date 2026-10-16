@@ -14,6 +14,7 @@ namespace UFS2Tool
         public const int Ufs2Magic = 0x19540119;       // UFS2 magic number (FS_UFS2_MAGIC)
         public const int CgMagic = 0x090255;            // Cylinder group magic (CG_MAGIC)
         public const int SuperblockOffset = 65536;      // SBLOCK_UFS2 superblock offset (64 KB)
+        public const int Ufs1SuperblockOffset = 8192;   // SBLOCK_UFS1 superblock offset (8 KB)
         public const int SuperblockSize = 8192;         // Superblock size (SBLOCKSIZE)
         public const int MaxMntLen = 468;               // Max mount point length (MAXMNTLEN)
         public const int MaxVolLen = 32;                // Max volume name length (MAXVOLLEN)
@@ -72,7 +73,7 @@ namespace UFS2Tool
         public const int Fs44InodeFmt = 2;     // FS_44INODEFMT - 4.4BSD inode format
 
         // Legacy superblock constants
-        public const int FsDynamicPostblFmt = -1; // FS_DYNAMICPOSTBLFMT - dynamic post block format
+        public const int FsDynamicPostblFmt = 1; // FS_DYNAMICPOSTBLFMT - dynamic post block format
 
         // Filesystem flags (fs_flags from sys/ufs/ffs/fs.h)
         public const int FsUnclean = 0x01;     // FS_UNCLEAN
