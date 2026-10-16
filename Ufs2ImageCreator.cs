@@ -35,8 +35,6 @@ namespace UFS2Tool
 
         // -i bytes-per-inode (0 = auto-calculate)
         public int BytesPerInode { get; set; } = 0;
-        // Inodes per group (computed from BytesPerInode or default)
-        public int InodesPerGroup { get; set; } = Ufs2Constants.DefaultInodesPerGroup;
 
         // -L volname
         public string VolumeName { get; set; } = "";
@@ -419,14 +417,7 @@ namespace UFS2Tool
             int fragsPerBlock = BlockSize / FragmentSize;
             long totalFrags = totalSizeBytes / FragmentSize;
             int inodeSize = InodeSizeForFormat;
-            int inodesPerGroup = ComputeInodesPerGroup(totalSizeBytes);
-
-            int fragsPerGroup = inodesPerGroup * fragsPerBlock;
-            int numCylGroups = (int)((totalFrags + fragsPerGroup - 1) / fragsPerGroup);
-            if (numCylGroups < 1) numCylGroups = 1;
-
-            fragsPerGroup = (int)(totalFrags / numCylGroups);
-            fragsPerGroup = (fragsPerGroup / fragsPerBlock) * fragsPerBlock;
+            var (fragsPerGroup, inodesPerGroup, numCylGroups) = ComputeCgGeometry(totalFrags, BytesPerInode);
 
             string formatStr = (FilesystemFormat == 1) ? "UFS1" : "UFS2";
             (Output ?? Console.Out).WriteLine($"  Format:        {formatStr} (-O {FilesystemFormat})");
@@ -460,33 +451,119 @@ namespace UFS2Tool
         }
 
         /// <summary>
-        /// Compute inodes per group based on BytesPerInode or defaults.
-        /// Follows FreeBSD's newfs logic for -i bytes-per-inode.
+        /// FreeBSD CGSIZE() from sys/ufs/ffs/fs.h: unrounded bytes of a CG header
+        /// (struct cg + old rotational tables + inode/frag/cluster maps + cluster summary).
         /// </summary>
-        private int ComputeInodesPerGroup(long totalSizeBytes)
+        private int CgSizeBytes(int ipg, int fpg)
         {
-            if (BytesPerInode > 0)
+            int fragsPerBlock = BlockSize / FragmentSize;
+            int maxContig = MaxContig > 0 ? MaxContig : Math.Max(1, Ufs2Constants.MaxPhys / BlockSize);
+            int contigSumSize = Math.Min(maxContig, Ufs2Constants.MaxContig);
+            // For UFS2, fs_old_cpg = 0 (not used); for UFS1, fs_old_cpg = 1
+            int oldCpg = (FilesystemFormat == 1) ? 1 : 0;
+            int size = Ufs2Constants.CgHeaderBaseSize
+                     + oldCpg * 4 + oldCpg * 2              // old btotoff (int32) + old boff (uint16)
+                     + (ipg + 7) / 8 + (fpg + 7) / 8 + 4;   // inode map + frag map + sizeof(int32_t)
+            if (contigSumSize > 0)
+                size += contigSumSize * 4 + (fpg / fragsPerBlock + 7) / 8;
+            return size;
+        }
+
+        /// <summary>
+        /// Cylinder group sizing ported from FreeBSD sbin/newfs/mkfs.c (releng/15.1):
+        /// find the smallest CG that meets the inode density, grow it until the CG
+        /// header fills a block or fewer than MINCYLGRPS groups remain, then shrink
+        /// it until the last CG can hold its own metadata.
+        /// </summary>
+        private (int fpg, int ipg, int ncg) ComputeCgGeometry(long totalFrags, int bytesPerInode)
+        {
+            const int Nfpi = 2;          // NFPI: default fragments per inode
+            const int MinCylGrps = 4;    // MINCYLGRPS
+            const int CgSizeFudge = 8;   // CGSIZEFUDGE
+            int frag = BlockSize / FragmentSize;
+            int inopb = BlockSize / InodeSizeForFormat;
+            int inopf = inopb / frag;
+            int sblkno = AlignUpInt(
+                (Ufs2Constants.SuperblockOffset + Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize, frag);
+            int cblkno = sblkno + AlignUpInt((Ufs2Constants.SuperblockSize + FragmentSize - 1) / FragmentSize, frag);
+            int iblkno = cblkno + frag;
+            // -c is compared against fs_fpg (fragments) exactly as FreeBSD does
+            long maxBlksPerCg = BlocksPerCylGroup > 0 ? BlocksPerCylGroup : 0x7fffffff;
+            long size = totalFrags;
+
+            long minFragsPerInode = 1 + size / ((1L << 32) - inopb);
+            long density = bytesPerInode > 0
+                ? Math.Max(bytesPerInode, minFragsPerInode * FragmentSize)
+                : Math.Max(Nfpi, minFragsPerInode) * FragmentSize;
+
+            long fragsPerInode, fpg, ipg;
+            long IpgFor(long f) => AlignUp((f + fragsPerInode - 1) / fragsPerInode, inopb);
+            for (;;)
             {
-                // User specified -i bytes-per-inode
-                long totalInodes = totalSizeBytes / BytesPerInode;
-                int fragsPerBlock = BlockSize / FragmentSize;
-                int fragsPerGroup = InodesPerGroup * fragsPerBlock;
-                long totalFrags = totalSizeBytes / FragmentSize;
-                int numCylGroups = (int)((totalFrags + fragsPerGroup - 1) / fragsPerGroup);
-                if (numCylGroups < 1) numCylGroups = 1;
-
-                int ipg = (int)(totalInodes / numCylGroups);
-                int inodeSize = InodeSizeForFormat;
-
-                // Round up to fill a complete block of inodes
-                int inodesPerBlock = BlockSize / inodeSize;
-                if (inodesPerBlock > 0)
-                    ipg = ((ipg + inodesPerBlock - 1) / inodesPerBlock) * inodesPerBlock;
-
-                return Math.Max(ipg, inodesPerBlock);
+                fragsPerInode = Math.Max(density / FragmentSize, 1);
+                if (fragsPerInode < minFragsPerInode)
+                    throw new ArgumentException(
+                        $"Block size {BlockSize} too small for a file system of this size.");
+                long minFpg = Math.Min(fragsPerInode * inopb, size);
+                ipg = inopb;
+                fpg = AlignUp(iblkno + ipg / inopf, frag);
+                if (fpg < minFpg) fpg = minFpg;
+                ipg = IpgFor(fpg);
+                fpg = AlignUp(iblkno + ipg / inopf, frag);
+                if (fpg < minFpg) fpg = minFpg;
+                ipg = IpgFor(fpg);
+                if (CgSizeBytes((int)ipg, (int)fpg) < BlockSize - CgSizeFudge)
+                    break;
+                density -= FragmentSize;
             }
 
-            return InodesPerGroup;
+            // UFS1 stores ipg in an int16_t, so it is limited to 2^15 - 1.
+            for (; fpg < maxBlksPerCg; fpg += frag)
+            {
+                ipg = IpgFor(fpg);
+                if (FilesystemFormat > 1 || ipg <= 0x7fff)
+                {
+                    if (size / fpg < MinCylGrps)
+                        break;
+                    int cgSize = CgSizeBytes((int)ipg, (int)fpg);
+                    if (cgSize < BlockSize - CgSizeFudge)
+                        continue;
+                    if (cgSize == BlockSize - CgSizeFudge)
+                        break;
+                }
+                fpg -= frag;
+                ipg = IpgFor(fpg);
+                break;
+            }
+
+            for (;;)
+            {
+                long lastMinFpg = AlignUp(iblkno + ipg / inopf, frag);
+                if (size < lastMinFpg)
+                    throw new ArgumentException(
+                        $"Filesystem size {size} < minimum size of {lastMinFpg} fragments.");
+                if (size % fpg >= lastMinFpg || size % fpg == 0)
+                    break;
+                fpg -= frag;
+                ipg = IpgFor(fpg);
+            }
+
+            // A CG must hold its metadata, and CG 0 also the csum area and root directory
+            // (FreeBSD mkfs minfpg). Small fsize puts dblkno past what a tiny group holds.
+            long dblkno = iblkno + ipg / inopf;
+            long ncg = (size + fpg - 1) / fpg;
+            while (fpg < dblkno + AlignUp(ncg * Ufs2Constants.CsumStructSize, BlockSize) / FragmentSize + frag)
+            {
+                fpg += frag;
+                ncg = Math.Max(1, (size + fpg - 1) / fpg);
+            }
+
+            // FreeBSD mkfs: a last CG too short for its own metadata is dropped and
+            // fs_size trimmed to ncg * fpg.
+            if (ncg > 1 && size % fpg != 0 && size % fpg < dblkno)
+                ncg--;
+
+            return ((int)fpg, (int)ipg, (int)ncg);
         }
 
         /// <summary>
@@ -500,20 +577,7 @@ namespace UFS2Tool
             int inodeSize = InodeSizeForFormat;
             int magic = MagicForFormat;
 
-            int inodesPerGroup = ComputeInodesPerGroup(totalSizeBytes);
-
-            // Calculate cylinder groups
-            int fragsPerGroup;
-            if (BlocksPerCylGroup > 0)
-            {
-                fragsPerGroup = BlocksPerCylGroup * fragsPerBlock;
-            }
-            else
-            {
-                fragsPerGroup = inodesPerGroup * fragsPerBlock;
-            }
-            int numCylGroups = (int)((totalFrags + fragsPerGroup - 1) / fragsPerGroup);
-            if (numCylGroups < 1) numCylGroups = 1;
+            var (fragsPerGroup, inodesPerGroup, numCylGroups) = ComputeCgGeometry(totalFrags, BytesPerInode);
 
             int bShift = Log2(BlockSize);
             int fShift = Log2(FragmentSize);
@@ -535,32 +599,22 @@ namespace UFS2Tool
             // fs_dblkno: data blocks follow inode blocks
             int dblkno = iblkno + inodeblks;
 
+            // ComputeCgGeometry may drop a too-short last CG: trim fs_size to match.
+            // fs_providersize keeps the full media size.
+            totalFrags = Math.Min(totalFrags, (long)numCylGroups * fragsPerGroup);
+
             // fs_maxbsize: maximum block size (MAXBSIZE = 65536 per FreeBSD)
             int maxBSize = Ufs2Constants.MaxBSize;
-            // fs_maxcontig: default is maxbsize/bsize per FreeBSD mkfs.c
-            int maxContig = MaxContig > 0 ? MaxContig : Math.Max(1, maxBSize / BlockSize);
+            // fs_maxcontig: default is MAXPHYS/bsize per FreeBSD mkfs.c
+            int maxContig = MaxContig > 0 ? MaxContig : Math.Max(1, Ufs2Constants.MaxPhys / BlockSize);
 
             // fs_cgsize: CG header size rounded up to fragment boundary
             // Matches FreeBSD CGSIZE() macro from sys/ufs/ffs/fs.h
             // CGSIZE = sizeof(struct cg) + fs_old_cpg*sizeof(int32) + fs_old_cpg*sizeof(uint16)
             //        + howmany(fs_ipg,8) + howmany(fs_fpg,8) + sizeof(int32)
             //        + (contigsumsize>0 ? contigsumsize*sizeof(int32) + howmany(fpg/frag,8) : 0)
-            int cgFixedHeaderSize = Ufs2Constants.CgHeaderBaseSize;
-            // For UFS2, fs_old_cpg = 0 (not used); for UFS1, fs_old_cpg = 1
-            int oldCpg = (FilesystemFormat == 1) ? 1 : 0;
-            int oldBtotSize = oldCpg * 4; // fs_old_cpg * sizeof(int32_t)
-            int oldBoffSize = oldCpg * 2; // fs_old_cpg * sizeof(uint16_t)
-            int inodeBitmapSize = (inodesPerGroup + 7) / 8;
-            int fragBitmapSize = (fragsPerGroup + 7) / 8;
             int contigSumSize = Math.Min(maxContig, Ufs2Constants.MaxContig);
-            int cgSizeRaw = cgFixedHeaderSize + oldBtotSize + oldBoffSize
-                          + inodeBitmapSize + fragBitmapSize + 4; // +4 = sizeof(int32_t) per CGSIZE
-            if (contigSumSize > 0)
-            {
-                int blocksPerGroup = fragsPerGroup / fragsPerBlock;
-                cgSizeRaw += contigSumSize * 4 + (blocksPerGroup + 7) / 8;
-            }
-            int cgSize = AlignUpInt(cgSizeRaw, FragmentSize);
+            int cgSize = AlignUpInt(CgSizeBytes(inodesPerGroup, fragsPerGroup), FragmentSize);
 
             // fs_cssize: cylinder group summary size
             int csumStructSize = Ufs2Constants.CsumStructSize;
@@ -649,7 +703,7 @@ namespace UFS2Tool
                 MinFreePercent = MinFreePercent,
                 Optimization = optimVal,
                 MaxContig = maxContig,
-                MaxBpg = MaxBpg > 0 ? MaxBpg : inodesPerGroup,
+                MaxBpg = MaxBpg > 0 ? MaxBpg : BlockSize / 8, // MAXBLKPG(bsize)
                 AvgFileSize = AvgFileSize,
                 AvgFilesPerDir = AvgFilesPerDir,
                 MaxSymlinkLen = maxSymlinkLen,
@@ -662,7 +716,7 @@ namespace UFS2Tool
                 ContigSumSize = contigSumSize,
                 // fs_providersize: size of underlying provider in fragments
                 // Per FreeBSD newfs: dbtofsb(mediasize / sectorsize)
-                ProviderSize = totalFrags,
+                ProviderSize = totalSizeBytes / FragmentSize,
                 // fs_metaspace: blocks reserved for metadata
                 // Per FreeBSD newfs: blknum(fpg * minfree / 200)
                 MetaSpace = ((long)fragsPerGroup * MinFreePercent / 200 / fragsPerBlock) * fragsPerBlock,
@@ -1630,21 +1684,13 @@ namespace UFS2Tool
                     // Each entry (file or directory) needs one inode, plus 3 reserved inodes
                     // (inode 0, inode 1, and the root directory inode 2).
                     long totalInodesNeeded = totalEntries + 3;
-                    int inodesPerGroup = ComputeInodesPerGroup(totalSizeBytes);
-                    int fragsPerBlock = BlockSize / FragmentSize;
-                    int fragsPerGroup = inodesPerGroup * fragsPerBlock;
-                    long totalFrags = totalSizeBytes / FragmentSize;
-                    int numCylGroups = Math.Max(1, (int)((totalFrags + fragsPerGroup - 1) / fragsPerGroup));
-                    long availableInodes = (long)numCylGroups * inodesPerGroup;
-
-                    if (totalInodesNeeded > availableInodes)
+                    for (;;)
                     {
+                        var (fpg, ipg, ncg) = ComputeCgGeometry(totalSizeBytes / FragmentSize, BytesPerInode);
+                        if ((long)ncg * ipg >= totalInodesNeeded)
+                            break;
                         // Need more CGs to hold all inodes
-                        int requiredCgs = (int)((totalInodesNeeded + inodesPerGroup - 1) / inodesPerGroup);
-                        long requiredFrags = (long)requiredCgs * fragsPerGroup;
-                        long requiredBytes = requiredFrags * FragmentSize;
-                        if (requiredBytes > totalSizeBytes)
-                            totalSizeBytes = AlignUp(requiredBytes, FragmentSize);
+                        totalSizeBytes += (long)fpg * FragmentSize;
                     }
 
                     (Output ?? Console.Out).WriteLine($"  Input directory: {directoryPath}");
@@ -1697,7 +1743,6 @@ namespace UFS2Tool
 
             // Save original state for restoration after MakeFsImage completes
             int origBytesPerInode = BytesPerInode;
-            int origBlocksPerCylGroup = BlocksPerCylGroup;
 
             try
             {
@@ -1747,54 +1792,17 @@ namespace UFS2Tool
                     fragsPerBlock);
                 int iblkno = cblkno + fragsPerBlock;
 
-                // Estimate ipg (inodes per group) to predict the CG layout that
-                // WriteFilesystem will produce after step 7 sets BytesPerInode.
-                int ipg;
-                if (BytesPerInode > 0)
-                {
-                    ipg = InodesPerGroup;
-                }
-                else if (totalInodes > 0)
-                {
-                    // Auto-density: estimate what ComputeInodesPerGroup will compute.
-                    int defaultFpg = InodesPerGroup * fragsPerBlock;
-                    // Use 20% overhead estimate to approximate the final image size
-                    // (minfree 8% + CG metadata ~2-5% + safety margin)
-                    long estTotalSize = Math.Max(totalSize * 120 / 100, (long)BlockSize * 16);
-                    long estTotalFrags = estTotalSize / FragmentSize;
-                    int estNumCg = Math.Max(1, (int)((estTotalFrags + defaultFpg - 1) / defaultFpg));
-                    ipg = (int)(totalInodes / estNumCg);
-                    ipg = Math.Max(((ipg + inodesPerBlock - 1) / inodesPerBlock) * inodesPerBlock, inodesPerBlock);
-                }
-                else
-                {
-                    ipg = InodesPerGroup;
-                }
-
-                int inodeblks = ((ipg + inodesPerBlock - 1) / inodesPerBlock) * fragsPerBlock;
-                int dblkno = iblkno + inodeblks;
-                bool autoMaxBpcg = false;
-                if (BlocksPerCylGroup <= 0)
-                {
-                    // Auto maxbpcg: choose the largest blocks/group that still provides
-                    // enough cylinder groups to fit all required inodes.
-                    int requiredCgForInodes = 1;
-                    if (totalInodes > 0 && ipg > 0)
-                        requiredCgForInodes = Math.Max(1, (int)((totalInodes + ipg - 1) / ipg));
-
-                    long minSizeForCalc = Math.Max(totalSize, (long)BlockSize * 16);
-                    long totalBlocksEstimate = Math.Max(1, (minSizeForCalc + BlockSize - 1) / BlockSize);
-                    long autoBpcg = (totalBlocksEstimate + requiredCgForInodes - 1) / requiredCgForInodes;
-
-                    long maxBpcgByInt = Math.Max(1, int.MaxValue / fragsPerBlock);
-                    if (autoBpcg > maxBpcgByInt)
-                        autoBpcg = maxBpcgByInt;
-
-                    BlocksPerCylGroup = (int)Math.Max(1, autoBpcg);
-                    autoMaxBpcg = true;
-                }
-
-                int fragsPerGroup = BlocksPerCylGroup * fragsPerBlock;
+                // Predict the CG layout WriteFilesystem will produce. Geometry is taken at
+                // the data size alone: a smaller size never yields fewer CGs or (via the
+                // step 7 density) fewer inodes per fragment, so the overhead is not undercounted.
+                // Floor: one CG must hold its inode table; 2x covers ipg rounding up.
+                long minEstFrags = iblkno + (2 * ((totalInodes + inodesPerBlock - 1) / inodesPerBlock) + 1) * fragsPerBlock;
+                long estTotalSize = Math.Max(Math.Max(totalSize, (long)BlockSize * 16), minEstFrags * FragmentSize);
+                int estDensity = BytesPerInode > 0 || totalInodes <= 0
+                    ? BytesPerInode
+                    : (int)Math.Min(estTotalSize / totalInodes + 1, int.MaxValue);
+                var (fragsPerGroup, ipg, _) = ComputeCgGeometry(estTotalSize / FragmentSize, estDensity);
+                int dblkno = iblkno + ipg / inodesPerBlock * fragsPerBlock;
 
                 // dataFragsPerCg: usable data fragments per CG (metadata consumes dblkno frags)
                 int dataFragsPerCg = fragsPerGroup - dblkno;
@@ -1825,7 +1833,9 @@ namespace UFS2Tool
 
                 // Scale data by CG overhead ratio: ceil(dataFrags * fpg / dataFragsPerCg) gives
                 // the total fragments needed including per-CG metadata, converted to bytes.
+                // The last CG carries full metadata for a partial data area: add one more.
                 totalSize = ((dataFragsNeeded * fragsPerGroup + dataFragsPerCg - 1) / dataFragsPerCg) * FragmentSize
+                          + (long)dblkno * FragmentSize
                           + fixedOverhead;
 
                 // ── Step 4: Enforce minimum size ──
@@ -1865,8 +1875,6 @@ namespace UFS2Tool
                 (Output ?? Console.Out).WriteLine($"  Image size:      {totalSize:N0} bytes ({totalSize / (1024 * 1024)} MB)");
                 if (autoDensity)
                     (Output ?? Console.Out).WriteLine($"  Auto density:    {BytesPerInode:N0} bytes/inode");
-                if (autoMaxBpcg)
-                    (Output ?? Console.Out).WriteLine($"  Auto maxbpcg:    {BlocksPerCylGroup:N0} blocks/CG");
                 (Output ?? Console.Out).WriteLine();
 
                 CreateImage(imagePath, totalSize);
@@ -1884,7 +1892,6 @@ namespace UFS2Tool
             {
                 // Restore original state in case the creator instance is reused
                 BytesPerInode = origBytesPerInode;
-                BlocksPerCylGroup = origBlocksPerCylGroup;
             }
         }
 

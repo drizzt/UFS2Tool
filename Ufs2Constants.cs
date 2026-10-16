@@ -26,6 +26,7 @@ namespace UFS2Tool
         public const int DefaultSectorSize = 512;       // 512 bytes sector size
         public const int MaxBSize = 65536;              // MAXBSIZE - maximum block size (64 KB)
         public const int MaxContig = 16;                // FS_MAXCONTIG - max summary size
+        public const int MaxPhys = 1048576;             // MAXPHYS on 64-bit FreeBSD (default maxcontig = MAXPHYS / bsize)
 
         // Default newfs parameters (matching FreeBSD defaults)
         public const int DefaultAvgFileSize = 16384;    // Average file size (-g)
@@ -33,7 +34,6 @@ namespace UFS2Tool
         public const int DefaultMinFreePercent = 8;     // Minimum free space % (-m)
 
         // Inode constants
-        public const int DefaultInodesPerGroup = 2048;
         public const int Ufs1InodeSize = 128;           // UFS1 dinode size
         public const int Ufs2InodeSize = 256;           // UFS2 dinode size
         public const int RootInode = 2;                 // Root directory inode number (UFS_ROOTINO)

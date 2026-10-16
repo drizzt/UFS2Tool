@@ -970,6 +970,37 @@ namespace UFS2Tool.Tests
             Assert.True(sb.IsUfs2, "version=2 should create UFS2 filesystem");
         }
 
+        [Theory]
+        [InlineData(1, 0)]
+        [InlineData(2, 0)]
+        [InlineData(2, 32L << 20)]
+        public void MakeFsImage_SmallFragments_CgHoldsItsMetadata(int format, long imageSize)
+        {
+            // At 4K/512 the 64K superblock offset puts dblkno past the auto blocks/CG
+            // that a small tree would pick; data then landed on the inode table.
+            var rnd = new Random(1);
+            Directory.CreateDirectory(Path.Combine(_testDir, "d1"));
+            for (int i = 1; i <= 12; i++)
+            {
+                var b = new byte[i * 1297 % 9000 + 1];
+                rnd.NextBytes(b);
+                File.WriteAllBytes(Path.Combine(_testDir, "d1", $"f{i}"), b);
+            }
+
+            var creator = new Ufs2ImageCreator { BlockSize = 4096, FragmentSize = 512, FilesystemFormat = format };
+            creator.MakeFsImage(_imagePath, _testDir, imageSize);
+
+            using var image = new Ufs2Image(_imagePath, readOnly: true);
+            var sb = image.Superblock;
+            Assert.True(sb.CylGroupSize > sb.DblkNo);
+            long lastCgFrags = sb.TotalBlocks - (long)(sb.NumCylGroups - 1) * sb.CylGroupSize;
+            Assert.True(lastCgFrags >= sb.DblkNo, $"last CG has {lastCgFrags} frags, dblkno {sb.DblkNo}");
+            var result = image.FsckUfs();
+            Assert.True(result.Clean, string.Join("\n", result.Errors));
+            Assert.Equal(File.ReadAllBytes(Path.Combine(_testDir, "d1", "f12")),
+                image.ReadFile(image.ResolvePath("/d1/f12")));
+        }
+
         [Fact]
         public void MakeFsImage_WithFreeBlocks_IncreasesImageSize()
         {
@@ -1178,10 +1209,8 @@ namespace UFS2Tool.Tests
 
             using var image = new Ufs2Image(_imagePath, readOnly: true);
             var sb = image.Superblock;
-            // With min_inodes, total inodes should be much less than default 2048
-            Assert.True(sb.InodesPerGroup < Ufs2Constants.DefaultInodesPerGroup,
-                $"min_inodes should use fewer than default {Ufs2Constants.DefaultInodesPerGroup}, " +
-                $"got {sb.InodesPerGroup}");
+            // With min_inodes, each CG gets the minimum of one block of inodes
+            Assert.Equal(sb.BSize / Ufs2Constants.Ufs2InodeSize, sb.InodesPerGroup);
         }
 
         [Fact]
