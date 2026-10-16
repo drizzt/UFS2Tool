@@ -165,22 +165,14 @@ namespace UFS2Tool
             if (inode == null)
                 return DokanResult.FileNotFound;
 
-            byte[] fileData;
             lock (_lock)
             {
                 var inodeData = _image.ReadInode(inode.Value);
                 if (!inodeData.IsRegularFile && !inodeData.IsSymlink)
                     return DokanResult.AccessDenied;
 
-                fileData = _image.ReadFile(inode.Value);
+                bytesRead = _image.ReadFileRange(inode.Value, offset, buffer);
             }
-
-            if (offset >= fileData.Length)
-                return DokanResult.Success;
-
-            int toRead = (int)Math.Min(buffer.Length, fileData.Length - offset);
-            Buffer.BlockCopy(fileData, (int)offset, buffer, 0, toRead);
-            bytesRead = toRead;
             return DokanResult.Success;
         }
 

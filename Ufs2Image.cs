@@ -358,6 +358,62 @@ namespace UFS2Tool
             return data;
         }
 
+        /// <summary>
+        /// Read up to dest.Length bytes of a regular file or symlink starting at
+        /// position, mapping only the blocks covering that range, so files larger
+        /// than a byte array can be read piecewise. Returns the bytes read (0 at EOF).
+        /// </summary>
+        public int ReadFileRange(uint inodeNumber, long position, Span<byte> dest)
+        {
+            var inode = ReadInode(inodeNumber);
+            if (!inode.IsRegularFile && !inode.IsSymlink)
+                throw new InvalidOperationException($"Inode {inodeNumber} is not a regular file or symlink.");
+            if (position < 0)
+                throw new ArgumentOutOfRangeException(nameof(position));
+            if (position >= inode.Size)
+                return 0;
+
+            int count = (int)Math.Min(dest.Length, inode.Size - position);
+            if (IsFastSymlink(inode))
+            {
+                ReadSymlinkTarget(inodeNumber).AsSpan((int)position, count).CopyTo(dest);
+                return count;
+            }
+
+            int bsize = Superblock.BSize;
+            int done = 0;
+            while (done < count)
+            {
+                long pos = position + done;
+                long lbn = pos / bsize;
+                int inBlock = (int)(pos % bsize);
+                long frag = ReadBlockPointerAt(inode, lbn);
+                int len = Math.Min(bsize - inBlock, count - done);
+
+                if (frag == 0)
+                {
+                    // Sparse hole reads as zeros
+                    dest.Slice(done, len).Clear();
+                    done += len;
+                    continue;
+                }
+
+                // Extend over physically contiguous blocks to issue one read
+                long nextFrag = frag + Superblock.FragsPerBlock;
+                while (done + len < count && ReadBlockPointerAt(inode, ++lbn) == nextFrag)
+                {
+                    len += Math.Min(bsize, count - done - len);
+                    nextFrag += Superblock.FragsPerBlock;
+                }
+
+                _stream.Position = frag * Superblock.FSize + inBlock;
+                _stream.ReadExactly(dest.Slice(done, len));
+                done += len;
+            }
+
+            return count;
+        }
+
         private long ReadIndirectBlock(long indirectBlockFrag, byte[] data, long offset, long fileSize)
         {
             long blockOffset = indirectBlockFrag * Superblock.FSize;
@@ -869,11 +925,20 @@ namespace UFS2Tool
         /// </summary>
         public void ExtractFile(uint inodeNumber, string outputPath)
         {
-            byte[] data = ReadFile(inodeNumber);
             string? dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            File.WriteAllBytes(outputPath, data);
+
+            // Stream in chunks so files larger than a byte array can be extracted
+            byte[] buffer = new byte[1 << 20];
+            using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write);
+            long position = 0;
+            int read;
+            while ((read = ReadFileRange(inodeNumber, position, buffer)) > 0)
+            {
+                output.Write(buffer, 0, read);
+                position += read;
+            }
         }
 
         /// <summary>
@@ -2294,14 +2359,14 @@ namespace UFS2Tool
         /// Read a block pointer at a given logical block index from an inode
         /// (supports direct, single-indirect, double-indirect, and triple-indirect).
         /// </summary>
-        private long ReadBlockPointerAt(Ufs2Inode inode, int blockIndex)
+        private long ReadBlockPointerAt(Ufs2Inode inode, long blockIndex)
         {
             if (blockIndex < Ufs2Constants.NDirect)
                 return inode.DirectBlocks[blockIndex];
 
             int ptrSize = Superblock.IsUfs1 ? 4 : 8;
             int pointersPerBlock = Superblock.BSize / ptrSize;
-            int remaining = blockIndex - Ufs2Constants.NDirect;
+            long remaining = blockIndex - Ufs2Constants.NDirect;
 
             // Single indirect
             if (remaining < pointersPerBlock)
@@ -2318,8 +2383,8 @@ namespace UFS2Tool
             if (remaining < ppb)
             {
                 if (inode.IndirectBlocks[1] == 0) return 0;
-                int idx1 = remaining / pointersPerBlock;
-                int idx2 = remaining % pointersPerBlock;
+                long idx1 = remaining / pointersPerBlock;
+                long idx2 = remaining % pointersPerBlock;
 
                 long dindBlockOffset = inode.IndirectBlocks[1] * Superblock.FSize;
                 _stream.Position = dindBlockOffset + (long)idx1 * ptrSize;
@@ -2329,14 +2394,14 @@ namespace UFS2Tool
                 _stream.Position = indPtr * Superblock.FSize + (long)idx2 * ptrSize;
                 return Superblock.IsUfs1 ? _reader.ReadInt32() : _reader.ReadInt64();
             }
-            remaining -= (int)ppb;
+            remaining -= ppb;
 
             // Triple indirect
             if (inode.IndirectBlocks[2] == 0) return 0;
-            int tIdx1 = (int)(remaining / ppb);
-            int tRemainder = (int)(remaining % ppb);
-            int tIdx2 = tRemainder / pointersPerBlock;
-            int tIdx3 = tRemainder % pointersPerBlock;
+            long tIdx1 = remaining / ppb;
+            long tRemainder = remaining % ppb;
+            long tIdx2 = tRemainder / pointersPerBlock;
+            long tIdx3 = tRemainder % pointersPerBlock;
 
             long tindBlockOffset = inode.IndirectBlocks[2] * Superblock.FSize;
             _stream.Position = tindBlockOffset + (long)tIdx1 * ptrSize;

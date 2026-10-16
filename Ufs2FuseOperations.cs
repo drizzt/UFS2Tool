@@ -173,12 +173,7 @@ namespace UFS2Tool
             int read = 0;
             var rc = Run(() =>
             {
-                byte[] data = _image.ReadFile(_image.ResolvePath(FuseHelper.GetString(fileNamePtr)));
-                if (position < data.Length)
-                {
-                    read = (int)Math.Min(buffer.Length, data.Length - position);
-                    data.AsSpan((int)position, read).CopyTo(buffer.Span);
-                }
+                read = _image.ReadFileRange(_image.ResolvePath(FuseHelper.GetString(fileNamePtr)), position, buffer.Span);
                 return PosixResult.Success;
             });
             readLength = read;
