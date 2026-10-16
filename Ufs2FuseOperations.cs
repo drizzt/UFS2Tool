@@ -380,7 +380,24 @@ namespace UFS2Tool
             => _readOnly ? PosixResult.EROFS : PosixResult.ENOTSUP;
 
         public PosixResult SymLink(ReadOnlyNativeMemory<byte> from, ReadOnlyNativeMemory<byte> to)
-            => _readOnly ? PosixResult.EROFS : PosixResult.ENOTSUP;
+        {
+            return RunWrite(() =>
+            {
+                // libfuse passes the link target first and the new link path second.
+                string linkPath = FuseHelper.GetString(to);
+                try
+                {
+                    _image.ResolvePath(linkPath);
+                    return PosixResult.EEXIST;
+                }
+                catch (FileNotFoundException)
+                {
+                }
+                _image.AddSymlink(GetParent(linkPath), linkPath[(linkPath.LastIndexOf('/') + 1)..],
+                    System.Text.Encoding.UTF8.GetBytes(FuseHelper.GetString(from)));
+                return PosixResult.Success;
+            });
+        }
 
         public PosixResult Link(ReadOnlyNativeMemory<byte> from, ReadOnlyNativeMemory<byte> to)
             => _readOnly ? PosixResult.EROFS : PosixResult.ENOTSUP;
