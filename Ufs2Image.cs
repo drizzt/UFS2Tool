@@ -257,7 +257,7 @@ namespace UFS2Tool
             if (!inode.IsSymlink)
                 throw new InvalidOperationException($"Inode {inodeNumber} is not a symlink.");
 
-            if (inode.Size >= Superblock.MaxSymlinkLen && inode.Blocks != 0)
+            if (!IsFastSymlink(inode))
                 return ReadFile(inodeNumber);
 
             // UFS1 pointers are 32-bit and were widened on read; take the on-disk width back.
@@ -273,6 +273,32 @@ namespace UFS2Tool
         }
 
         /// <summary>
+        /// A short symlink keeps its target inline in the block pointers instead of
+        /// data blocks (FreeBSD fsck_ffs ckinode, ffs_truncate).
+        /// </summary>
+        private bool IsFastSymlink(Ufs2Inode inode) =>
+            inode.IsSymlink && (inode.Size < Superblock.MaxSymlinkLen || inode.Blocks == 0);
+
+        /// <summary>
+        /// Store a short symlink target inline in the block pointer area, the
+        /// reverse of ReadSymlinkTarget. The caller checks it fits.
+        /// </summary>
+        private void PackFastSymlink(Ufs2Inode inode, byte[] target)
+        {
+            int ptrSize = Superblock.IsUfs1 ? 4 : 8;
+            byte[] raw = new byte[(Ufs2Constants.NDirect + Ufs2Constants.NIndirect) * ptrSize];
+            target.CopyTo(raw, 0);
+            for (int i = 0; i < Ufs2Constants.NDirect + Ufs2Constants.NIndirect; i++)
+            {
+                long ptr = ptrSize == 4 ? BitConverter.ToInt32(raw, i * 4) : BitConverter.ToInt64(raw, i * 8);
+                if (i < Ufs2Constants.NDirect)
+                    inode.DirectBlocks[i] = ptr;
+                else
+                    inode.IndirectBlocks[i - Ufs2Constants.NDirect] = ptr;
+            }
+        }
+
+        /// <summary>
         /// Read the contents of a regular file or symlink by inode number.
         /// </summary>
         public byte[] ReadFile(uint inodeNumber)
@@ -280,6 +306,10 @@ namespace UFS2Tool
             var inode = ReadInode(inodeNumber);
             if (!inode.IsRegularFile && !inode.IsSymlink)
                 throw new InvalidOperationException($"Inode {inodeNumber} is not a regular file or symlink.");
+
+            // Its block pointers hold the target text, not block numbers
+            if (IsFastSymlink(inode))
+                return ReadSymlinkTarget(inodeNumber);
 
             if (inode.Size > int.MaxValue)
                 throw new InvalidOperationException(
@@ -847,6 +877,23 @@ namespace UFS2Tool
         }
 
         /// <summary>
+        /// Extract a symlink as a host symlink. Windows needs elevation for
+        /// symlinks, so there the target is written as a text file instead.
+        /// </summary>
+        private void ExtractSymlink(uint inodeNumber, string outputPath)
+        {
+            string target = System.Text.Encoding.UTF8.GetString(ReadSymlinkTarget(inodeNumber)).TrimEnd('\0');
+            // Replace a file or link left by an earlier extraction, as ExtractFile does
+            var existing = new FileInfo(outputPath);
+            if (existing.Exists || existing.LinkTarget != null)
+                existing.Delete();
+            if (OperatingSystem.IsWindows())
+                File.WriteAllText(outputPath, target);
+            else
+                File.CreateSymbolicLink(outputPath, target);
+        }
+
+        /// <summary>
         /// Recursively extract the contents of a directory inode to a host directory.
         /// </summary>
         public void ExtractToDirectory(uint dirInodeNumber, string outputDir)
@@ -854,7 +901,9 @@ namespace UFS2Tool
             Directory.CreateDirectory(outputDir);
             var entries = ListDirectory(dirInodeNumber);
 
-            foreach (var entry in entries)
+            // Symlinks go last, so no entry of a crafted image with a duplicate
+            // name gets written through one to a path outside outputDir
+            foreach (var entry in entries.OrderBy(e => e.FileType == Ufs2Constants.DtLnk))
             {
                 // Skip "." and ".." to avoid infinite recursion
                 if (entry.Name == "." || entry.Name == "..")
@@ -872,15 +921,7 @@ namespace UFS2Tool
                 }
                 else if (entry.FileType == Ufs2Constants.DtLnk)
                 {
-                    // Read symlink target from inode data blocks
-                    var inode = ReadInode(entry.Inode);
-                    if (inode.Size > 0 && inode.Size < Superblock.BSize)
-                    {
-                        byte[] linkData = ReadFile(entry.Inode);
-                        string target = System.Text.Encoding.UTF8.GetString(linkData).TrimEnd('\0');
-                        // Write symlink target as a text file (symlinks may not be supported on host OS)
-                        File.WriteAllText(destPath, target);
-                    }
+                    ExtractSymlink(entry.Inode, destPath);
                 }
                 // Other file types (DtFifo, DtChr, DtBlk, DtSock) are skipped
             }
@@ -899,7 +940,7 @@ namespace UFS2Tool
             {
                 ExtractToDirectory(inodeNumber, outputDir);
             }
-            else if (inode.IsRegularFile)
+            else if (inode.IsRegularFile || inode.IsSymlink)
             {
                 string trimmedPath = fsPath.TrimEnd('/');
                 string fileName = Path.GetFileName(trimmedPath);
@@ -907,7 +948,10 @@ namespace UFS2Tool
                     throw new InvalidOperationException("Cannot determine file name from the given path.");
                 string destPath = Path.Combine(outputDir, fileName);
                 Directory.CreateDirectory(outputDir);
-                ExtractFile(inodeNumber, destPath);
+                if (inode.IsSymlink)
+                    ExtractSymlink(inodeNumber, destPath);
+                else
+                    ExtractFile(inodeNumber, destPath);
             }
             else
             {
@@ -1947,8 +1991,7 @@ namespace UFS2Tool
         /// </summary>
         private void FreeFileBlocks(Ufs2Inode inode)
         {
-            // A short symlink keeps its target inline in the block pointers (FreeBSD ffs_truncate)
-            if (inode.IsSymlink && (inode.Size < Superblock.MaxSymlinkLen || inode.Blocks == 0))
+            if (IsFastSymlink(inode))
                 return;
 
             bool fullTail = TailHoldsFullBlock(inode);
@@ -2538,6 +2581,65 @@ namespace UFS2Tool
         }
 
         /// <summary>
+        /// Create a symlink in the UFS image (FreeBSD ufs_symlink). A target shorter
+        /// than fs_maxsymlinklen is stored inline, a longer one in a data block.
+        /// </summary>
+        public void AddSymlink(string parentFsPath, string name, byte[] target)
+        {
+            if (IsReadOnly)
+                throw new InvalidOperationException("Cannot add symlink: image is opened read-only.");
+            // MAXPATHLEN includes the terminating NUL
+            if (target.Length == 0 || target.Length >= 1024)
+                throw new ArgumentException($"Symlink target length {target.Length} is out of range.");
+
+            uint parentInode = ResolvePath(parentFsPath);
+            int cgIndex = (int)(parentInode / Superblock.InodesPerGroup);
+
+            long newIno = AllocateInode(cgIndex);
+            if (newIno < 0)
+                throw new InvalidOperationException("No free inodes available.");
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var inode = new Ufs2Inode
+            {
+                Mode = Ufs2Constants.IfLnk | 0x1ED, // rwxr-xr-x
+                NLink = 1,
+                Size = target.Length,
+                BlkSize = (uint)Superblock.BSize,
+                AccessTime = now,
+                ModTime = now,
+                ChangeTime = now,
+                CreateTime = now,
+                Generation = Random.Shared.Next(1, int.MaxValue)
+            };
+
+            if (target.Length < Superblock.MaxSymlinkLen)
+            {
+                PackFastSymlink(inode, target);
+            }
+            else
+            {
+                long blk = AllocateBlock(cgIndex);
+                if (blk < 0)
+                    throw new InvalidOperationException("No free blocks available for symlink data.");
+                byte[] writeBuffer = new byte[Superblock.BSize];
+                target.CopyTo(writeBuffer, 0);
+                _stream.Position = blk * Superblock.FSize;
+                _stream.Write(writeBuffer, 0, writeBuffer.Length);
+                inode.DirectBlocks[0] = blk;
+                inode.Blocks = Superblock.FragsPerBlock * (Superblock.FSize / 512);
+                TrimTail(inode);
+            }
+
+            WriteInode((uint)newIno, inode);
+            AddDirectoryEntry(parentInode, name, (uint)newIno, Ufs2Constants.DtLnk);
+
+            Superblock.Time = now;
+            WriteSuperblock();
+            _stream.Flush();
+        }
+
+        /// <summary>
         /// Create a new directory in the UFS image.
         /// </summary>
         public void AddDirectory(string parentFsPath, string name)
@@ -2645,7 +2747,13 @@ namespace UFS2Tool
             if (IsReadOnly)
                 throw new InvalidOperationException("Cannot add: image is opened read-only.");
 
-            if (File.Exists(sourcePath))
+            if (new FileInfo(sourcePath).LinkTarget is { } linkTarget)
+            {
+                // Store the link itself, not what it points to
+                Output?.WriteLine($"  Adding symlink: {fsPath}");
+                AddSymlink(GetParentPath(fsPath), GetLastComponent(fsPath), System.Text.Encoding.UTF8.GetBytes(linkTarget));
+            }
+            else if (File.Exists(sourcePath))
             {
                 // Source is a file — use the fs path's filename for the entry name
                 string parentPath = GetParentPath(fsPath);
@@ -2675,21 +2783,29 @@ namespace UFS2Tool
         /// </summary>
         private void AddDirectoryContentsRecursive(string fsDir, string sourceDir)
         {
-            foreach (string filePath in Directory.GetFiles(sourceDir))
+            // Directory.GetFiles/GetDirectories also return symlinks, so pick them out first
+            var entries = new DirectoryInfo(sourceDir).GetFileSystemInfos();
+
+            foreach (var entry in entries.Where(e => e.LinkTarget == null && e is FileInfo))
             {
-                string fileName = Path.GetFileName(filePath);
-                string fsFilePath = fsDir.TrimEnd('/') + "/" + fileName;
+                string fsFilePath = fsDir.TrimEnd('/') + "/" + entry.Name;
                 Output?.WriteLine($"  Adding file: {fsFilePath}");
-                AddFile(fsDir, filePath);
+                AddFile(fsDir, entry.FullName);
             }
 
-            foreach (string subDirPath in Directory.GetDirectories(sourceDir))
+            foreach (var entry in entries.Where(e => e.LinkTarget != null))
             {
-                string subDirName = Path.GetFileName(subDirPath);
-                string fsDirPath = fsDir.TrimEnd('/') + "/" + subDirName;
+                string fsLinkPath = fsDir.TrimEnd('/') + "/" + entry.Name;
+                Output?.WriteLine($"  Adding symlink: {fsLinkPath}");
+                AddSymlink(fsDir, entry.Name, System.Text.Encoding.UTF8.GetBytes(entry.LinkTarget!));
+            }
+
+            foreach (var entry in entries.Where(e => e.LinkTarget == null && e is DirectoryInfo))
+            {
+                string fsDirPath = fsDir.TrimEnd('/') + "/" + entry.Name;
                 Output?.WriteLine($"  Adding directory: {fsDirPath}");
-                AddDirectory(fsDir, subDirName);
-                AddDirectoryContentsRecursive(fsDirPath, subDirPath);
+                AddDirectory(fsDir, entry.Name);
+                AddDirectoryContentsRecursive(fsDirPath, entry.FullName);
             }
         }
 
@@ -3874,8 +3990,10 @@ namespace UFS2Tool
                     fileCount++;
                 }
 
+                bool fastLink = IsFastSymlink(inode);
+
                 // Validate block pointers
-                for (int bi = 0; bi < Ufs2Constants.NDirect; bi++)
+                for (int bi = 0; !fastLink && bi < Ufs2Constants.NDirect; bi++)
                 {
                     long blk = inode.DirectBlocks[bi];
                     if (blk == 0) continue;
@@ -3903,7 +4021,7 @@ namespace UFS2Tool
                 }
 
                 // Validate indirect block pointers (check that the pointers themselves are in range)
-                for (int ii = 0; ii < Ufs2Constants.NIndirect; ii++)
+                for (int ii = 0; !fastLink && ii < Ufs2Constants.NIndirect; ii++)
                 {
                     long iblk = inode.IndirectBlocks[ii];
                     if (iblk == 0) continue;

@@ -220,7 +220,7 @@ export DISPLAY=:0
   ufs2tool mount_udf -o rw myimage.img ~/ufs  # modify, truncate, delete, rename existing entries
   ufs2tool umount_udf ~/ufs                   # or Ctrl+C in the mount_udf terminal
   ```
-  As on Windows, new files and directories cannot be created through the mount.
+  As on Windows, new files and directories cannot be created through the mount, but symlinks can (`ln -s`).
 - The Linux kernel `ufs` driver (`mount -t ufs -o ufstype=ufs2`) only mounts filesystems with a fragment
   size of 4096 bytes or less, and fails with `fragment size 65536 is too large` otherwise. Such images are
   valid FFS and work on FreeBSD; on Linux use `mount_udf` instead. `newfs` warns when `-f` is above 4096.

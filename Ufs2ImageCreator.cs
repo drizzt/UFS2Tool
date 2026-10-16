@@ -1477,9 +1477,10 @@ namespace UFS2Tool
                     try
                     {
                         totalEntries++;
-                        if (entry is FileInfo file)
+                        // A symlink is stored as its target text, never followed
+                        if (entry.LinkTarget != null || entry is FileInfo)
                         {
-                            long len = file.Length;
+                            long len = SourceEntryLength(entry);
                             rawSize += len;
                             if (blockSize > 0 && len > 0)
                             {
@@ -1550,6 +1551,13 @@ namespace UFS2Tool
             }
             return (rawSize, blockAlignedSize, totalEntries);
         }
+
+        /// <summary>
+        /// Bytes a host file or symlink takes in the image. A short symlink is stored
+        /// inline and takes none, but counting its target keeps this format-agnostic.
+        /// </summary>
+        private static long SourceEntryLength(FileSystemInfo entry) =>
+            entry.LinkTarget is { } target ? System.Text.Encoding.UTF8.GetByteCount(target) : ((FileInfo)entry).Length;
 
         /// <summary>
         /// Calculate directory sizes using FreeBSD 14.0.0 ffs_size_dir ADDSIZE/ADDDIRENT logic.
@@ -1633,9 +1641,10 @@ namespace UFS2Tool
                     try
                     {
                         totalEntries++;
-                        if (entry is FileInfo file)
+                        // A symlink is stored as its target text, never followed
+                        if (entry.LinkTarget != null || entry is FileInfo)
                         {
-                            long len = file.Length;
+                            long len = SourceEntryLength(entry);
                             rawSize += len;
                             if (len > 0)
                                 AddSize(len);
@@ -2101,16 +2110,16 @@ namespace UFS2Tool
 
             foreach (var entry in new DirectoryInfo(dirPath).EnumerateFileSystemInfos("*", SearchOption.TopDirectoryOnly))
             {
-                if (entry is DirectoryInfo subDir)
+                if (entry.LinkTarget == null && entry is DirectoryInfo subDir)
                 {
                     var (subFiles, subBytes) = CountFilesAndBytesRecursive(subDir.FullName);
                     totalFiles += subFiles;
                     totalBytes += subBytes;
                 }
-                else if (entry is FileInfo file)
+                else
                 {
                     totalFiles++;
-                    totalBytes += file.Length;
+                    totalBytes += SourceEntryLength(entry);
                 }
             }
 
@@ -2160,7 +2169,9 @@ namespace UFS2Tool
 
             foreach (var entry in new DirectoryInfo(dirPath).EnumerateFileSystemInfos("*", SearchOption.TopDirectoryOnly))
             {
-                if (entry is DirectoryInfo subDir)
+                // Host symlinks are stored as UFS symlinks, so a link to a directory is not recursed
+                byte[]? link = entry.LinkTarget is { } t ? System.Text.Encoding.UTF8.GetBytes(t) : null;
+                if (link == null && entry is DirectoryInfo subDir)
                 {
                     if (nextInode >= maxInodes)
                         throw new InvalidOperationException(
@@ -2224,7 +2235,7 @@ namespace UFS2Tool
                     if (cgForDir < dirsPerCg.Length)
                         dirsPerCg[cgForDir]++;
                 }
-                else if (entry is FileInfo file)
+                else if (link != null || entry is FileInfo)
                 {
                     if (nextInode >= maxInodes)
                         throw new InvalidOperationException(
@@ -2232,12 +2243,19 @@ namespace UFS2Tool
                             "Try increasing image size or use fewer files.");
 
                     uint fileInode = nextInode++;
-                    long fileSize = file.Length;
+                    long fileSize = link?.Length ?? ((FileInfo)entry).Length;
                     int completedFilesBeforeCurrent = filesWritten;
+
+                    // A short symlink target lives in the inode itself and needs no data block
+                    bool fastLink = link != null && link.Length < sb.MaxSymlinkLen;
+                    // Nothing to read for an empty file, and opening a FIFO would block
+                    using Stream source = fastLink || fileSize == 0 ? Stream.Null
+                        : link != null ? new MemoryStream(link)
+                        : new FileStream(entry.FullName, FileMode.Open, FileAccess.Read);
 
                     // Allocate blocks and write file content
                     var fileAlloc = AllocateAndWriteFile(
-                        fs, writer, file.FullName, fileSize, sb,
+                        fs, writer, source, fastLink ? 0 : fileSize, sb,
                         fragsPerBlock, fragsPerGroup, dataStartFrag,
                         ref nextDataFragInCg, ref currentCg,
                         perCgHighWater: perCgHighWater, totalFrags: totalFrags,
@@ -2273,9 +2291,10 @@ namespace UFS2Tool
                     // Write file inode
                     WriteInodeAtPosition(fs, writer, fileInode, inodeTableOffset,
                         inodeSize, sb.InodesPerGroup, fragsPerGroup, sb.FSize,
-                        sb.BSize, dataStartFrag, false, fileSize, fileAlloc, timestamp);
+                        sb.BSize, dataStartFrag, false, fileSize, fileAlloc, timestamp,
+                        symlinkTarget: link, maxSymlinkLen: sb.MaxSymlinkLen);
 
-                    parentEntries.Add((file.Name, fileInode, Ufs2Constants.DtReg));
+                    parentEntries.Add((entry.Name, fileInode, link != null ? Ufs2Constants.DtLnk : Ufs2Constants.DtReg));
                     filesWritten++;
                     onCopyProgress?.Invoke(filesWritten, 0);
                 }
@@ -2407,7 +2426,7 @@ namespace UFS2Tool
         /// Returns the number of data blocks written. Updates lastDataBlockFrag with the last allocated data block.
         /// </summary>
         private int AllocateAndWriteSingleIndirectBlock(
-            FileStream fs, BinaryWriter writer, FileStream fileStream,
+            FileStream fs, BinaryWriter writer, Stream fileStream,
             byte[] buffer, int count, Ufs2Superblock sb, long indirectBlockFrag,
             int fragsPerBlock, int fragsPerGroup, int dataStartFrag,
             ref int nextDataFragInCg, ref int currentCg,
@@ -2455,7 +2474,7 @@ namespace UFS2Tool
         /// Supports direct blocks (up to 12), single-indirect, double-indirect, and triple-indirect blocks.
         /// </summary>
         private FileBlockAllocation AllocateAndWriteFile(
-            FileStream fs, BinaryWriter writer, string filePath, long fileSize,
+            FileStream fs, BinaryWriter writer, Stream fileStream, long fileSize,
             Ufs2Superblock sb, int fragsPerBlock, int fragsPerGroup, int dataStartFrag,
             ref int nextDataFragInCg, ref int currentCg,
             int[]? perCgHighWater = null, long totalFrags = 0,
@@ -2478,7 +2497,6 @@ namespace UFS2Tool
             int ptrSize = (FilesystemFormat == 1) ? 4 : 8;
             int pointersPerBlock = sb.BSize / ptrSize;
 
-            using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read);
             byte[] buffer = new byte[sb.BSize];
             long lastDataBlockFrag = 0;
 
@@ -2945,7 +2963,8 @@ namespace UFS2Tool
             int inodesPerGroup, int fragsPerGroup, int fragSize,
             int blockSize, int dataStartFrag, bool isDirectory, long size,
             FileBlockAllocation allocation, long timestamp,
-            short? nlink = null, uint dirDepth = 0)
+            short? nlink = null, uint dirDepth = 0,
+            byte[]? symlinkTarget = null, int maxSymlinkLen = 0)
         {
             int cgIndex = (int)(inodeNum / inodesPerGroup);
             int inodeIndexInCg = (int)(inodeNum % inodesPerGroup);
@@ -3005,6 +3024,21 @@ namespace UFS2Tool
             long metadataFrags = (long)allocation.MetadataBlockCount * fragsPerBlock;
             long blocks512 = (dataFrags + metadataFrags) * sectorsPerFrag;
 
+            ushort mode = (ushort)((isDirectory ? Ufs2Constants.IfDir : Ufs2Constants.IfReg) |
+                (isDirectory ? Ufs2Constants.PermDir : Ufs2Constants.PermFile));
+            // A short symlink keeps its target in the block pointer area (FreeBSD ufs_symlink)
+            byte[]? inlineTarget = null;
+            if (symlinkTarget != null)
+            {
+                mode = Ufs2Constants.IfLnk | 0x1ED; // rwxr-xr-x
+                if (symlinkTarget.Length < maxSymlinkLen)
+                {
+                    blocks512 = 0;
+                    inlineTarget = new byte[(Ufs2Constants.NDirect + Ufs2Constants.NIndirect) * 8];
+                    symlinkTarget.CopyTo(inlineTarget, 0);
+                }
+            }
+
             // Use provided nlink, or default: 2 for directories, 1 for files
             short effectiveNLink = nlink ?? (isDirectory ? (short)2 : (short)1);
 
@@ -3013,8 +3047,7 @@ namespace UFS2Tool
                 int time32 = (int)(timestamp & 0xFFFFFFFF);
                 var inode = new Ufs1Inode
                 {
-                    Mode = (ushort)((isDirectory ? Ufs2Constants.IfDir : Ufs2Constants.IfReg) |
-                           (isDirectory ? Ufs2Constants.PermDir : Ufs2Constants.PermFile)),
+                    Mode = mode,
                     NLink = effectiveNLink,
                     Size = size,
                     Blocks = (int)blocks512,
@@ -3031,14 +3064,20 @@ namespace UFS2Tool
                     inode.IndirectBlocks[1] = (int)allocation.DoubleIndirectBlockFrag;
                 if (allocation.TripleIndirectBlockFrag != 0)
                     inode.IndirectBlocks[2] = (int)allocation.TripleIndirectBlockFrag;
+                if (inlineTarget != null)
+                {
+                    for (int i = 0; i < Ufs2Constants.NDirect; i++)
+                        inode.DirectBlocks[i] = BitConverter.ToInt32(inlineTarget, i * 4);
+                    for (int i = 0; i < Ufs2Constants.NIndirect; i++)
+                        inode.IndirectBlocks[i] = BitConverter.ToInt32(inlineTarget, (Ufs2Constants.NDirect + i) * 4);
+                }
                 inode.WriteTo(writer);
             }
             else
             {
                 var inode = new Ufs2Inode
                 {
-                    Mode = (ushort)((isDirectory ? Ufs2Constants.IfDir : Ufs2Constants.IfReg) |
-                           (isDirectory ? Ufs2Constants.PermDir : Ufs2Constants.PermFile)),
+                    Mode = mode,
                     NLink = effectiveNLink,
                     BlkSize = (uint)blockSize,
                     Size = size,
@@ -3058,6 +3097,13 @@ namespace UFS2Tool
                     inode.IndirectBlocks[1] = allocation.DoubleIndirectBlockFrag;
                 if (allocation.TripleIndirectBlockFrag != 0)
                     inode.IndirectBlocks[2] = allocation.TripleIndirectBlockFrag;
+                if (inlineTarget != null)
+                {
+                    for (int i = 0; i < Ufs2Constants.NDirect; i++)
+                        inode.DirectBlocks[i] = BitConverter.ToInt64(inlineTarget, i * 8);
+                    for (int i = 0; i < Ufs2Constants.NIndirect; i++)
+                        inode.IndirectBlocks[i] = BitConverter.ToInt64(inlineTarget, (Ufs2Constants.NDirect + i) * 8);
+                }
                 inode.WriteTo(writer);
             }
         }

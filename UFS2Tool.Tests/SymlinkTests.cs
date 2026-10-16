@@ -4,8 +4,8 @@
 namespace UFS2Tool.Tests
 {
     /// <summary>
-    /// Tests for short ("fast") symlinks, whose target is stored inline in the
-    /// inode block pointers instead of in a data block.
+    /// Tests for symlinks: short ("fast") ones, whose target is stored inline in
+    /// the inode block pointers, and longer ones stored in a data block.
     /// </summary>
     public class SymlinkTests : IDisposable
     {
@@ -64,9 +64,120 @@ namespace UFS2Tool.Tests
                 Assert.Throws<FileNotFoundException>(() => image.ResolvePath("/link"));
             }
 
+            AssertFsckClean();
+        }
+
+        // 200 bytes is past fs_maxsymlinklen on both formats (60 for UFS1, 120 for UFS2).
+        private static readonly string LongTarget = "long/" + new string('x', 195);
+
+        private void AssertFsckClean()
+        {
             using var checkImage = new Ufs2Image(_imagePath, readOnly: true);
             var result = checkImage.FsckUfs(preen: true);
             Assert.True(result.Clean, $"Fsck errors: {string.Join("; ", result.Errors)}");
+        }
+
+        private void CreateImage(int format)
+        {
+            var creator = new Ufs2ImageCreator { FilesystemFormat = format };
+            var (_, diskSize, _) = Ufs2ImageCreator.CalculateDirectorySizes(_testDir, creator.BlockSize);
+            creator.CreateImage(_imagePath, creator.CalculateImageSize(diskSize));
+            creator.PopulateFromDirectory(_imagePath, _testDir);
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void PopulateFromDirectory_StoresHostSymlinks(int format)
+        {
+            // Creating host symlinks needs elevation or Developer Mode on Windows
+            if (OperatingSystem.IsWindows())
+                return;
+            Directory.CreateDirectory(Path.Combine(_testDir, "sub"));
+            File.WriteAllText(Path.Combine(_testDir, "sub", "file.txt"), "data");
+            File.CreateSymbolicLink(Path.Combine(_testDir, "short"), "sub/file.txt");
+            File.CreateSymbolicLink(Path.Combine(_testDir, "long"), LongTarget);
+            Directory.CreateSymbolicLink(Path.Combine(_testDir, "sub", "loop"), "..");
+            CreateImage(format);
+
+            using (var image = new Ufs2Image(_imagePath, readOnly: true))
+            {
+                Assert.Equal("sub/file.txt"u8.ToArray(), image.ReadSymlinkTarget(image.ResolvePath("/short")));
+                Assert.Equal(0, image.ReadInode(image.ResolvePath("/short")).Blocks);
+                Assert.Equal(System.Text.Encoding.UTF8.GetBytes(LongTarget), image.ReadSymlinkTarget(image.ResolvePath("/long")));
+                var loop = image.ListDirectory(image.ResolvePath("/sub")).Single(e => e.Name == "loop");
+                Assert.Equal(Ufs2Constants.DtLnk, loop.FileType);
+                Assert.Equal(".."u8.ToArray(), image.ReadSymlinkTarget(loop.Inode));
+            }
+            AssertFsckClean();
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void Add_StoresSymlinksAndDeleteFreesSlowOne(int format)
+        {
+            if (OperatingSystem.IsWindows())
+                return;
+            CreateImage(format);
+            string hostDir = Path.Combine(_testDir, "host");
+            Directory.CreateDirectory(hostDir);
+            File.CreateSymbolicLink(Path.Combine(hostDir, "short"), "target");
+            File.CreateSymbolicLink(Path.Combine(hostDir, "long"), LongTarget);
+
+            using (var image = new Ufs2Image(_imagePath, readOnly: false))
+            {
+                image.Add("/l", Path.Combine(hostDir, "long"));
+                image.Add("/d", hostDir);
+                Assert.Equal(System.Text.Encoding.UTF8.GetBytes(LongTarget), image.ReadSymlinkTarget(image.ResolvePath("/l")));
+                Assert.Equal("target"u8.ToArray(), image.ReadSymlinkTarget(image.ResolvePath("/d/short")));
+                Assert.Equal(System.Text.Encoding.UTF8.GetBytes(LongTarget), image.ReadSymlinkTarget(image.ResolvePath("/d/long")));
+            }
+            AssertFsckClean();
+
+            using (var image = new Ufs2Image(_imagePath, readOnly: false))
+            {
+                image.Delete("/l");
+                image.Delete("/d");
+            }
+            AssertFsckClean();
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void Extract_WritesHostSymlinks(int format)
+        {
+            if (OperatingSystem.IsWindows())
+                return;
+            File.CreateSymbolicLink(Path.Combine(_testDir, "short"), "target");
+            File.CreateSymbolicLink(Path.Combine(_testDir, "long"), LongTarget);
+            CreateImage(format);
+
+            string outDir = Path.Combine(_testDir, "out");
+            using var image = new Ufs2Image(_imagePath, readOnly: true);
+            image.Extract("/", outDir);
+            Assert.Equal("target", new FileInfo(Path.Combine(outDir, "short")).LinkTarget);
+            Assert.Equal(LongTarget, new FileInfo(Path.Combine(outDir, "long")).LinkTarget);
+
+            string single = Path.Combine(_testDir, "single");
+            image.Extract("/long", single);
+            Assert.Equal(LongTarget, new FileInfo(Path.Combine(single, "long")).LinkTarget);
+
+            // Extracting again over the previous output replaces the links
+            image.Extract("/", outDir);
+            Assert.Equal("target", new FileInfo(Path.Combine(outDir, "short")).LinkTarget);
+        }
+
+        [Theory]
+        [InlineData(1)]
+        [InlineData(2)]
+        public void ReadFile_FastSymlinkReturnsTarget(int format)
+        {
+            CreateImage(format);
+            using var image = new Ufs2Image(_imagePath, readOnly: false);
+            image.AddSymlink("/", "short", "dir/file.txt"u8.ToArray());
+            Assert.Equal("dir/file.txt"u8.ToArray(), image.ReadFile(image.ResolvePath("/short")));
         }
     }
 }

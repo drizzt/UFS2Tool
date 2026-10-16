@@ -456,7 +456,7 @@ ufs2tool mount_udf [-o options] [-v] <image-path> <drive-letter | directory>
 **Limitations:**
 - Windows: symlinks are presented as regular files containing the link target
 - Linux: symlinks are real symlinks; ownership changes and cross-directory renames are refused
-- New files, directories and links cannot be created through the mount
+- New files, directories and hard links cannot be created through the mount; on Linux, symlinks can
 
 ### `umount_udf` — Unmount a UFS image
 
@@ -565,9 +565,9 @@ ufs2tool umount_udf <drive-letter | directory>
 
 - Implements FuseDotNet `IFuseOperations` to mount a UFS image on a Linux directory (libfuse3)
 - Same `Ufs2Image` calls and locking as the Dokan backend
-- Exposes Unix mode, owner, link count, inode numbers and nanosecond timestamps; reads fast and slow symlinks
-- Read-write mode: write, truncate, unlink, rmdir (empty only), same-directory rename, chmod, utimes
-- Create, mkdir, symlink, link and chown are refused
+- Exposes Unix mode, owner, link count, inode numbers and nanosecond timestamps; reads and creates fast and slow symlinks
+- Read-write mode: write, truncate, unlink, rmdir (empty only), same-directory rename, chmod, utimes, symlink
+- Create, mkdir, link and chown are refused
 
 ## GUI Application (`UFS2Tool.GUI`)
 
